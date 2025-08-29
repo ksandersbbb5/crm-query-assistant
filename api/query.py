@@ -144,18 +144,19 @@ def parse_airtable_query(question):
     query_conditions = {}
     question_lower = question.lower()
     
-    # Check for state filters
+    # Check for state filters - but only match whole words
     state_abbrevs = {
         'vermont': 'VT', 'vt': 'VT',
         'massachusetts': 'MA', 'ma': 'MA', 
-        'maine': 'ME', 'me': 'ME',
+        'maine': 'ME',  # Remove 'me': 'ME' to avoid false matches
         'new hampshire': 'NH', 'nh': 'NH',
         'rhode island': 'RI', 'ri': 'RI',
         'connecticut': 'CT', 'ct': 'CT'
     }
     
+    # Use word boundaries to match whole words only
     for state_name, abbrev in state_abbrevs.items():
-        if state_name in question_lower:
+        if re.search(r'\b' + state_name + r'\b', question_lower):
             query_conditions['state'] = abbrev
             break
     
