@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CRM Query Assistant</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 900px; 
+            margin: 0 auto; 
+            padding: 20px;
+            line-height: 1.6;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #eee;
+        }
+        .query-container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .query-box { 
+            width: 100%; 
+            padding: 12px; 
+            border: 2px solid #e1e5e9; 
+            border-radius: 6px; 
+            font-size: 16px;
+            font-family: inherit;
+            resize: vertical;
+        }
+        .query-box:focus {
+            outline: none;
+            border-color: #0066cc;
+        }
+        .ask-button { 
+            background: linear-gradient(135deg, #0066cc, #004499);
+            color: white; 
+            padding: 12px 30px; 
+            border: none; 
+            border-radius: 6px; 
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            margin-top: 10px;
+            transition: all 0.2s;
+        }
+        .ask-button:hover { 
+            background: linear-gradient(135deg, #0052a3, #003366);
+            transform: translateY(-1px);
+        }
+        .ask-button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .result-container { 
+            background: #f8f9fa; 
+            padding: 20px; 
+            border-radius: 6px; 
+            margin: 20px 0;
+            border-left: 4px solid #0066cc;
+        }
+        .error { 
+            color: #d73502; 
+            background: #fff5f5; 
+            padding: 15px; 
+            border-radius: 6px;
+            border-left: 4px solid #d73502;
+        }
+        .loading { 
+            color: #666; 
+            font-style: italic;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .sql-details {
+            margin-top: 15px;
+        }
+        .sql-query { 
+            background: #f1f3f4; 
+            padding: 12px; 
+            border-radius: 4px; 
+            font-family: 'Monaco', 'Menlo', monospace; 
+            font-size: 13px;
+            overflow-x: auto;
+        }
+        .examples {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 6px;
+            margin-top: 30px;
+        }
+        .examples ul {
+            margin: 0;
+            padding-left: 20px;
+        }
+        .examples li {
+            margin: 8px 0;
+            cursor: pointer;
+            color: #0066cc;
+        }
+        .examples li:hover {
+            text-decoration: underline;
+        }
+        .spinner {
+            border: 2px solid #f3f3f3;
+            border-top: 2px solid #0066cc;
+            border-radius: 50%;
+            width: 16px;
+            height: 16px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>CRM Query Assistant</h1>
+        <p>Ask questions about your CRM data in natural language</p>
+    </div>
+    
+    <div class="query-container">
+        <textarea 
+            id="question" 
+            class="query-box" 
+            rows="3" 
+            placeholder="Example: What's the status of application ID 12345?"
+        ></textarea>
+        <button id="askButton" class="ask-button" onclick="askQuestion()">Ask Question</button>
+    </div>
+    
+    <div id="result"></div>
+    
+    <div class="examples">
+        <h3>Example Questions:</h3>
+        <ul>
+            <li onclick="setQuestion(this)">What's the status of application ID 45874?</li>
+            <li onclick="setQuestion(this)">Show me all applications from ME with invoice total over $1000 created in 2025</li>
+            <li onclick="setQuestion(this)">List the top 10 cities by number of applications</li>
+            <li onclick="setQuestion(this)">Give me average invoice amount by salesperson in 2025</li>
+            <li onclick="setQuestion(this)">How many applications were rejected or denied?</li>
+            <li onclick="setQuestion(this)">Which salesperson has the most processed applications?</li>
+            <li onclick="setQuestion(this)">Show me applications with outstanding invoice balance</li>
+            <li onclick="setQuestion(this)">List all applications from Boston with their business names</li>
+            <li onclick="setQuestion(this)">What's the total invoice amount for all processed applications?</li>
+            <li onclick="setQuestion(this)">Show me applications created this week</li>
+        </ul>
+    </div>
+
+    <script>
+        function setQuestion(element) {
+            document.getElementById('question').value = element.textContent;
+        }
+
+        async function askQuestion() {
+            const question = document.getElementById('question').value;
+            const resultDiv = document.getElementById('result');
+            const askButton = document.getElementById('askButton');
+            
+            if (!question.trim()) {
+                alert('Please enter a question');
+                return;
+            }
+            
+            askButton.disabled = true;
+            askButton.textContent = 'Processing...';
+            
+            resultDiv.innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    Processing your question...
+                </div>
+            `;
+            
+            try {
+                const response = await fetch('/api/query', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ question: question })
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    resultDiv.innerHTML = `<div class="error"><strong>Error:</strong> ${data.error}</div>`;
+                } else {
+                    resultDiv.innerHTML = `
+                        <div class="result-container">
+                            <h3>Answer:</h3>
+                            <p>${data.answer}</p>
+                            ${data.results_count ? `<small><em>Found ${data.results_count} records</em></small>` : ''}
+                            <details class="sql-details">
+                                <summary style="cursor: pointer; margin-top: 10px;">View Generated SQL</summary>
+                                <div class="sql-query">${data.sql}</div>
+                            </details>
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `<div class="error"><strong>Network Error:</strong> ${error.message}</div>`;
+            } finally {
+                askButton.disabled = false;
+                askButton.textContent = 'Ask Question';
+            }
+        }
+        
+        // Allow Ctrl+Enter to submit
+        document.getElementById('question').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && e.ctrlKey) {
+                askQuestion();
+            }
+        });
+    </script>
+</body>
+</html>
