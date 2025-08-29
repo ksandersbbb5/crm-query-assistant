@@ -2,8 +2,4 @@ requests==2.32.5
 openai==0.28.1
 pymssql==2.2.11
 python-dotenv==1.0.0
-requests==2.32.5
-openai==0.28.1
-pymssql==2.2.11
-python-dotenv==1.0.0
 pyairtable==2.3.0
