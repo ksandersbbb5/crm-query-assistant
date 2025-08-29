@@ -5,6 +5,14 @@ import json
 import decimal
 import datetime
 
+# Try to import pyodbc for SQL Server connection
+try:
+    import pyodbc
+    PYODBC_AVAILABLE = True
+except ImportError:
+    PYODBC_AVAILABLE = False
+    print("pyodbc not available - using mock data only")
+
 # Configure OpenAI
 openai.api_key = os.environ.get('OPENAI_API_KEY')
 
@@ -53,6 +61,31 @@ Common States: MA, ME, VT, RI, NH, CT (New England states)
 """
     return schema_info
 
+def get_db_connection():
+    """Create SQL Server connection"""
+    if not PYODBC_AVAILABLE:
+        return None
+        
+    # Check if we have all required environment variables
+    required_vars = ['SQL_SERVER', 'SQL_DATABASE', 'SQL_USERNAME', 'SQL_PASSWORD']
+    if not all(os.environ.get(var) for var in required_vars):
+        print("Missing required SQL Server environment variables")
+        return None
+    
+    try:
+        connection_string = (
+            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+            f"SERVER={os.environ.get('SQL_SERVER')};"
+            f"DATABASE={os.environ.get('SQL_DATABASE')};"
+            f"UID={os.environ.get('SQL_USERNAME')};"
+            f"PWD={os.environ.get('SQL_PASSWORD')};"
+            f"TrustServerCertificate=yes;"
+        )
+        return pyodbc.connect(connection_string)
+    except Exception as e:
+        print(f"SQL Server connection error: {str(e)}")
+        return None
+
 def text_to_sql(question, schema):
     """Convert question to SQL"""
     try:
@@ -63,8 +96,16 @@ def text_to_sql(question, schema):
                 return "SELECT * FROM Applications WHERE AppID = 45874"
             elif "count" in question.lower():
                 return "SELECT COUNT(*) as count FROM Applications"
+            elif "average" in question.lower() and "invoice" in question.lower():
+                return "SELECT rep, AVG(invoice_total) as avg_invoice FROM Applications GROUP BY rep ORDER BY avg_invoice DESC"
+            elif "rejected" in question.lower() or "denied" in question.lower():
+                return "SELECT * FROM Applications WHERE app_status IN ('Rejected/Denied') ORDER BY DateCreated DESC"
+            elif "balance" in question.lower():
+                return "SELECT * FROM Applications WHERE invoice_balance > 0 ORDER BY invoice_balance DESC"
+            elif "top" in question.lower() and "cities" in question.lower():
+                return "SELECT TOP 10 city, COUNT(*) as count FROM Applications GROUP BY city ORDER BY count DESC"
             else:
-                return "SELECT TOP 5 * FROM Applications"
+                return "SELECT TOP 5 * FROM Applications ORDER BY DateCreated DESC"
         
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
@@ -110,9 +151,9 @@ Rules:
         
     except Exception as e:
         # Return a default query for testing
-        return "SELECT TOP 5 * FROM Applications"
+        return "SELECT TOP 5 * FROM Applications ORDER BY DateCreated DESC"
 
-def execute_sql_via_rest(sql_query):
+def execute_sql_via_rest_mock(sql_query):
     """Execute SQL query using mock data for testing"""
     try:
         # Mock data for testing the interface
@@ -203,6 +244,50 @@ def execute_sql_via_rest(sql_query):
     except Exception as e:
         return None, str(e)
 
+def execute_sql_via_rest(sql_query):
+    """Execute SQL query against actual SQL Server or fall back to mock data"""
+    # Try real SQL Server connection first
+    conn = get_db_connection()
+    
+    if conn:
+        try:
+            cursor = conn.cursor()
+            
+            # Execute the query
+            cursor.execute(sql_query)
+            
+            # Get column names
+            columns = [column[0] for column in cursor.description] if cursor.description else []
+            
+            # Fetch all results
+            results = []
+            for row in cursor.fetchall():
+                result_dict = {}
+                for i, column in enumerate(columns):
+                    value = row[i]
+                    # Handle different data types
+                    if isinstance(value, decimal.Decimal):
+                        value = float(value)
+                    elif isinstance(value, datetime.datetime):
+                        value = value.isoformat()
+                    elif isinstance(value, datetime.date):
+                        value = value.isoformat()
+                    result_dict[column] = value
+                results.append(result_dict)
+            
+            cursor.close()
+            conn.close()
+            
+            return results, None
+            
+        except Exception as e:
+            print(f"SQL execution error: {str(e)}")
+            # Fall back to mock data
+            return execute_sql_via_rest_mock(sql_query)
+    else:
+        # Use mock data if no SQL connection available
+        return execute_sql_via_rest_mock(sql_query)
+
 def format_results(results, question):
     """Use LLM to format results into natural language answer"""
     if not results:
@@ -212,9 +297,24 @@ def format_results(results, question):
         # For testing without OpenAI key
         if not openai.api_key:
             if len(results) == 1:
-                return f"Found 1 result: {json.dumps(results[0], indent=2)}"
+                # Format single result nicely
+                if 'count' in results[0]:
+                    return f"The count is: {results[0]['count']:,}"
+                else:
+                    formatted = "Found 1 result:\n"
+                    for key, value in results[0].items():
+                        formatted += f"- {key}: {value}\n"
+                    return formatted.strip()
             else:
-                return f"Found {len(results)} results. First few: {json.dumps(results[:3], indent=2)}"
+                formatted = f"Found {len(results)} results:\n\n"
+                for i, result in enumerate(results[:3], 1):
+                    formatted += f"Result {i}:\n"
+                    for key, value in result.items():
+                        formatted += f"- {key}: {value}\n"
+                    formatted += "\n"
+                if len(results) > 3:
+                    formatted += f"... and {len(results) - 3} more results"
+                return formatted.strip()
         
         # Convert results to a readable format
         if len(results) == 1:
@@ -245,7 +345,8 @@ def format_results(results, question):
         return response.choices[0].message.content.strip()
         
     except Exception as e:
-        return f"Results: {json.dumps(results, indent=2)}"
+        # Fallback formatting
+        return f"Results: {json.dumps(results[:5], indent=2)}"
 
 class handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
