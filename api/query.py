@@ -246,10 +246,16 @@ def execute_sql_via_rest_mock(sql_query):
 
 def execute_sql_via_rest(sql_query):
     """Execute SQL query against actual SQL Server or fall back to mock data"""
+    # Add debug logging
+    print(f"Attempting to execute SQL: {sql_query}")
+    print(f"SQL_SERVER env: {os.environ.get('SQL_SERVER', 'Not Set')}")
+    print(f"PYODBC Available: {PYODBC_AVAILABLE}")
+    
     # Try real SQL Server connection first
     conn = get_db_connection()
     
     if conn:
+        print("Successfully connected to SQL Server!")
         try:
             cursor = conn.cursor()
             
@@ -278,6 +284,7 @@ def execute_sql_via_rest(sql_query):
             cursor.close()
             conn.close()
             
+            print(f"Query returned {len(results)} results from real database")
             return results, None
             
         except Exception as e:
@@ -286,6 +293,7 @@ def execute_sql_via_rest(sql_query):
             return execute_sql_via_rest_mock(sql_query)
     else:
         # Use mock data if no SQL connection available
+        print("No SQL connection available, using mock data")
         return execute_sql_via_rest_mock(sql_query)
 
 def format_results(results, question):
@@ -352,9 +360,68 @@ class handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
+
+    def do_GET(self):
+        """Handle GET requests for testing"""
+        try:
+            if self.path == '/api/query/test':
+                # Test database connection
+                test_results = {
+                    "pyodbc_available": PYODBC_AVAILABLE,
+                    "sql_server": os.environ.get('SQL_SERVER', 'Not Set'),
+                    "sql_database": os.environ.get('SQL_DATABASE', 'Not Set'),
+                    "sql_username": os.environ.get('SQL_USERNAME', 'Not Set'),
+                    "sql_password": "***" if os.environ.get('SQL_PASSWORD') else "Not Set",
+                    "openai_key": "Set" if os.environ.get('OPENAI_API_KEY') else "Not Set",
+                    "connection_test": "Not Tested"
+                }
+                
+                # Try to connect
+                if PYODBC_AVAILABLE and all([
+                    os.environ.get('SQL_SERVER'),
+                    os.environ.get('SQL_DATABASE'),
+                    os.environ.get('SQL_USERNAME'),
+                    os.environ.get('SQL_PASSWORD')
+                ]):
+                    try:
+                        conn = get_db_connection()
+                        if conn:
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT COUNT(*) as count FROM Applications")
+                            result = cursor.fetchone()
+                            test_results["connection_test"] = f"Success! Found {result[0]} records"
+                            cursor.close()
+                            conn.close()
+                        else:
+                            test_results["connection_test"] = "Failed to create connection"
+                    except Exception as e:
+                        test_results["connection_test"] = f"Error: {str(e)}"
+                else:
+                    test_results["connection_test"] = "Missing configuration"
+                
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps(test_results, indent=2).encode())
+                return
+                
+            # Default GET response
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(b"CRM Query API is running")
+            
+        except Exception as e:
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': str(e)}).encode())
 
     def do_POST(self):
         try:
