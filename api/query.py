@@ -121,17 +121,11 @@ def get_db_connection():
         return None
     
     try:
-        # Try with port explicitly specified
-        server = os.environ.get('SQL_SERVER')
-        if ':' not in server:
-            server = f"{server}:1433"  # Add default SQL Server port
-            
         conn = pymssql.connect(
-            server=server,
+            server=os.environ.get('SQL_SERVER'),
             database=os.environ.get('SQL_DATABASE'),
             user=os.environ.get('SQL_USERNAME'),
             password=os.environ.get('SQL_PASSWORD'),
-            tds_version='7.4',  # Explicitly set TDS version for Azure SQL
             as_dict=True  # Return results as dictionaries
         )
         return conn
@@ -244,6 +238,7 @@ def search_airtable(query_conditions=None):
     except Exception as e:
         print(f"Airtable error: {str(e)}")
         return []
+
 def text_to_sql(question, schema):
     """Convert question to SQL or determine if Airtable query needed"""
     try:
@@ -275,26 +270,12 @@ def text_to_sql(question, schema):
             else:
                 return {"type": "sql", "query": "SELECT TOP 5 * FROM Applications ORDER BY DateCreated DESC"}
         
-       response = openai.ChatCompletion.create(
-    model="gpt-3.5-turbo",
-    messages=[
-        {
-            "role": "system",
-            "content": """Format database query results into a clear, natural language answer. 
-            IMPORTANT: 
-            - If asked about 'most', 'least', count occurrences of each unique value
-            - If asked 'which X has the most Y', group by X and count Y
-            - Don't assume the total record count is the answer
-            - Analyze the data structure to provide accurate counts"""
-        },
-        {
-            "role": "user",
-            "content": f"Question: {question}\n\nData: {result_text}\n\nAnalyze this data and answer the question accurately."
-        }
-    ],
-    temperature=0.1,
-    max_tokens=300
-)
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"""Convert natural language to SQL Server queries or indicate if Airtable data is needed.
                     
 {schema}
 
@@ -491,27 +472,40 @@ def format_results(results, question):
                     formatted += f"... and {len(results) - 5} more results"
                 return formatted.strip()
         
-     # Use OpenAI to format results
-# Convert results to a readable format
-if len(results) == 1:
-    result_text = f"Found 1 result: {results[0]}"
-else:
-    result_text = f"Found {len(results)} results:\n"
-    for i, result in enumerate(results[:10]):  # Limit to first 10 results
-        result_text += f"{i+1}. {result}\n"
-    if len(results) > 10:
-        result_text += f"... and {len(results) - 10} more results"
+        # Use OpenAI to format results
+        # Convert results to a readable format
+        if len(results) == 1:
+            result_text = f"Found 1 result: {results[0]}"
+        elif len(results) > 20:
+            # Send a summary instead of all records
+            result_summary = {
+                "total_records": len(results),
+                "sample_records": results[:5],
+                "all_fields": list(results[0].keys()) if results else []
+            }
+            result_text = f"Dataset summary: {json.dumps(result_summary, indent=2)}\nNote: Showing summary due to large result set. Analyze the pattern in the sample records to answer the question."
+        else:
+            result_text = f"Found {len(results)} results:\n"
+            for i, result in enumerate(results[:10]):  # Limit to first 10 results
+                result_text += f"{i+1}. {result}\n"
+            if len(results) > 10:
+                result_text += f"... and {len(results) - 10} more results"
         
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
                 {
                     "role": "system",
-                    "content": "Format database query results into a clear, natural language answer. Be concise but informative. If the question asks for counts, provide the count. If it asks for specific data, list the relevant information."
+                    "content": """Format database query results into a clear, natural language answer. 
+IMPORTANT: 
+- If asked about 'most', 'least', count occurrences of each unique value
+- If asked 'which X has the most Y', group by X and count Y
+- Don't assume the total record count is the answer
+- Analyze the data structure to provide accurate counts"""
                 },
                 {
                     "role": "user",
-                    "content": f"Question: {question}\n\nResults: {result_text}\n\nPlease format this into a clear answer:"
+                    "content": f"Question: {question}\n\nData: {result_text}\n\nAnalyze this data and answer the question accurately."
                 }
             ],
             temperature=0.1,
