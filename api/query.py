@@ -2,8 +2,6 @@ import requests
 import openai
 import os
 import json
-import urllib.parse
-import base64
 
 # Configure OpenAI
 openai.api_key = os.environ.get('OPENAI_API_KEY')
@@ -102,24 +100,10 @@ Rules:
         return f"Error generating SQL: {str(e)}"
 
 def execute_sql_via_rest(sql_query):
-    """Execute SQL query using Azure SQL Database REST API"""
+    """Execute SQL query using mock data for testing"""
     try:
-        # Azure SQL Database REST API endpoint
-        server = os.environ.get('AZURE_SQL_SERVER')
-        database = os.environ.get('AZURE_SQL_DATABASE')
-        username = os.environ.get('AZURE_SQL_USERNAME')
-        password = os.environ.get('AZURE_SQL_PASSWORD')
+        # Mock data for testing the interface
         
-        # Create connection string for REST API
-        connection_string = f"Server=tcp:{server},1433;Initial Catalog={database};Persist Security Info=False;User ID={username};Password={password};MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
-        
-        # Use Azure Data Studio REST API approach
-        # This is a simplified approach - in production you'd want to use Azure's official REST APIs
-        
-        # For now, let's create a mock response to test the system
-        # In a real implementation, you would use Azure's official SQL REST API
-        
-        # Mock data for testing - replace with actual REST API call
         if "AppID" in sql_query and "45874" in sql_query:
             mock_results = [
                 {
@@ -142,10 +126,56 @@ def execute_sql_via_rest(sql_query):
                 {"city": "Springfield", "count": 800},
                 {"city": "Lowell", "count": 600}
             ]
-        else:
+        elif "rep" in sql_query.lower() and ("AVG" in sql_query.upper() or "average" in sql_query.lower()):
+            mock_results = [
+                {"rep": "Cochrane, Valerie", "avg_invoice": 625.50},
+                {"rep": "DeLuca, MaryJane", "avg_invoice": 615.75},
+                {"rep": "Padula, Denise", "avg_invoice": 595.25},
+                {"rep": "Better Business Bureau, Online", "avg_invoice": 542.80}
+            ]
+        elif "rejected" in sql_query.lower() or "denied" in sql_query.lower():
             mock_results = [
                 {
-                    "AppID": 12345,
+                    "AppID": 8783,
+                    "app_status": "Rejected/Denied",
+                    "dba": "Chiropractic Solutions, LLC",
+                    "city": "Framingham",
+                    "state": "MA",
+                    "rep": "Weinstein, Sheryl"
+                },
+                {
+                    "AppID": 721,
+                    "app_status": "Rejected/Denied", 
+                    "dba": "P&L Limousine",
+                    "city": "Dorchester",
+                    "state": "MA",
+                    "rep": "Better Business Bureau, Better"
+                }
+            ]
+        elif "balance" in sql_query.lower() and ">" in sql_query:
+            mock_results = [
+                {
+                    "AppID": 83068,
+                    "dba": "FDS Installers Inc",
+                    "city": "Wareham",
+                    "state": "MA",
+                    "invoice_balance": 581,
+                    "rep": "IABBB, Online"
+                },
+                {
+                    "AppID": 78763,
+                    "dba": "0136673821",
+                    "city": "New Bedford",
+                    "state": "MA",
+                    "invoice_balance": 281,
+                    "rep": "Better Business Bureau, Online"
+                }
+            ]
+        else:
+            # Default sample results
+            mock_results = [
+                {
+                    "AppID": 45874,
                     "app_status": "Processed/Accepted", 
                     "dba": "Sample Business",
                     "city": "Boston",
@@ -211,70 +241,71 @@ def handler(request):
                 }
             }
         
-        # Handle POST request
-        if hasattr(request, 'method') and request.method == 'POST':
-            # Get request body
-            try:
-                if hasattr(request, 'get_json'):
-                    data = request.get_json()
-                elif hasattr(request, 'json'):
-                    data = request.json
-                else:
-                    import json
-                    data = json.loads(request.body if hasattr(request, 'body') else '{}')
-            except:
-                data = {}
-            
-            question = data.get('question', '')
-            
-            if not question:
-                return {
-                    'statusCode': 400,
-                    'headers': {'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json'},
-                    'body': json.dumps({'error': 'No question provided'})
-                }
-            
-            # Process question
-            schema = get_database_schema()
-            sql_query = text_to_sql(question, schema)
-            
-            if sql_query.startswith('Error'):
-                return {
-                    'statusCode': 500,
-                    'headers': {'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json'},
-                    'body': json.dumps({'error': sql_query})
-                }
-            
-            results, error = execute_sql_via_rest(sql_query)
-            
-            if error:
-                return {
-                    'statusCode': 500,
-                    'headers': {'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json'},
-                    'body': json.dumps({'error': f'Database error: {error}', 'sql': sql_query})
-                }
-            
-            answer = format_results(results, question)
-            
+        # Parse request body
+        body = getattr(request, 'body', '{}')
+        if isinstance(body, bytes):
+            body = body.decode('utf-8')
+        
+        data = json.loads(body) if body and body != '{}' else {}
+        question = data.get('question', '')
+        
+        if not question:
             return {
-                'statusCode': 200,
-                'headers': {'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json'},
-                'body': json.dumps({
-                    'answer': answer,
-                    'sql': sql_query,
-                    'results_count': len(results) if results else 0
-                })
+                'statusCode': 400,
+                'headers': {
+                    'Access-Control-Allow-Origin': '*',
+                    'Content-Type': 'application/json'
+                },
+                'body': json.dumps({'error': 'No question provided'})
             }
         
+        # Process question
+        schema = get_database_schema()
+        sql_query = text_to_sql(question, schema)
+        
+        if sql_query.startswith('Error'):
+            return {
+                'statusCode': 500,
+                'headers': {
+                    'Access-Control-Allow-Origin': '*',
+                    'Content-Type': 'application/json'
+                },
+                'body': json.dumps({'error': sql_query})
+            }
+        
+        results, error = execute_sql_via_rest(sql_query)
+        
+        if error:
+            return {
+                'statusCode': 500,
+                'headers': {
+                    'Access-Control-Allow-Origin': '*',
+                    'Content-Type': 'application/json'
+                },
+                'body': json.dumps({'error': f'Database error: {error}', 'sql': sql_query})
+            }
+        
+        answer = format_results(results, question)
+        
         return {
-            'statusCode': 405,
-            'headers': {'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json'},
-            'body': json.dumps({'error': 'Method not allowed'})
+            'statusCode': 200,
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+            },
+            'body': json.dumps({
+                'answer': answer,
+                'sql': sql_query,
+                'results_count': len(results) if results else 0
+            })
         }
         
     except Exception as e:
         return {
             'statusCode': 500,
-            'headers': {'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json'},
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+            },
             'body': json.dumps({'error': f'Server error: {str(e)}'})
         }
