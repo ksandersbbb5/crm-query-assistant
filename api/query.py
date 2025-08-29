@@ -275,12 +275,26 @@ def text_to_sql(question, schema):
             else:
                 return {"type": "sql", "query": "SELECT TOP 5 * FROM Applications ORDER BY DateCreated DESC"}
         
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"""Convert natural language to SQL Server queries or indicate if Airtable data is needed.
+       response = openai.ChatCompletion.create(
+    model="gpt-3.5-turbo",
+    messages=[
+        {
+            "role": "system",
+            "content": """Format database query results into a clear, natural language answer. 
+            IMPORTANT: 
+            - If asked about 'most', 'least', count occurrences of each unique value
+            - If asked 'which X has the most Y', group by X and count Y
+            - Don't assume the total record count is the answer
+            - Analyze the data structure to provide accurate counts"""
+        },
+        {
+            "role": "user",
+            "content": f"Question: {question}\n\nData: {result_text}\n\nAnalyze this data and answer the question accurately."
+        }
+    ],
+    temperature=0.1,
+    max_tokens=300
+)
                     
 {schema}
 
@@ -477,16 +491,16 @@ def format_results(results, question):
                     formatted += f"... and {len(results) - 5} more results"
                 return formatted.strip()
         
-        # Use OpenAI to format results
-        # Convert results to a readable format
-        if len(results) == 1:
-            result_text = f"Found 1 result: {results[0]}"
-        else:
-            result_text = f"Found {len(results)} results:\n"
-            for i, result in enumerate(results[:10]):  # Limit to first 10 results
-                result_text += f"{i+1}. {result}\n"
-            if len(results) > 10:
-                result_text += f"... and {len(results) - 10} more results"
+     # Use OpenAI to format results
+# Convert results to a readable format
+if len(results) == 1:
+    result_text = f"Found 1 result: {results[0]}"
+else:
+    result_text = f"Found {len(results)} results:\n"
+    for i, result in enumerate(results[:10]):  # Limit to first 10 results
+        result_text += f"{i+1}. {result}\n"
+    if len(results) > 10:
+        result_text += f"... and {len(results) - 10} more results"
         
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
