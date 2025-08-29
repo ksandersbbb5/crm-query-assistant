@@ -5,6 +5,7 @@ import json
 import decimal
 import datetime
 import re
+import urllib.parse
 
 # Try to import pymssql for SQL Server connection
 try:
@@ -169,22 +170,27 @@ def search_airtable(query_conditions=None):
         if not AIRTABLE_AVAILABLE:
             return []
         
-        if not all([
-            os.environ.get('AIRTABLE_API_KEY'),
-            os.environ.get('AIRTABLE_BASE_ID'),
-            os.environ.get('AIRTABLE_TABLE_NAME')
-        ]):
+        api_key = os.environ.get('AIRTABLE_API_KEY')
+        base_id = os.environ.get('AIRTABLE_BASE_ID')
+        table_name = os.environ.get('AIRTABLE_TABLE_NAME')
+        
+        if not all([api_key, base_id, table_name]):
             print("Missing Airtable configuration")
             return []
             
-        api = Api(os.environ.get('AIRTABLE_API_KEY'))
-        table = api.table(
-            os.environ.get('AIRTABLE_BASE_ID'),
-            os.environ.get('AIRTABLE_TABLE_NAME')
-        )
+        api = Api(api_key)
         
-        # Get all records
-        records = table.all()
+        # Try both the raw table name and URL-encoded version
+        try:
+            table = api.table(base_id, table_name)
+            records = table.all()
+        except Exception as e:
+            print(f"First attempt failed: {e}")
+            # Try URL-encoded table name
+            encoded_table_name = urllib.parse.quote(table_name)
+            print(f"Trying encoded table name: {encoded_table_name}")
+            table = api.table(base_id, encoded_table_name)
+            records = table.all()
         
         # Convert to consistent format
         results = []
@@ -194,7 +200,8 @@ def search_airtable(query_conditions=None):
                 'source': 'airtable'
             }
             # Add all fields from the record
-            for key, value in record['fields'].items():
+            fields = record.get('fields', {})
+            for key, value in fields.items():
                 # Handle attachment fields specially
                 if key == 'Photo' and isinstance(value, list):
                     result[key] = [att.get('url', '') for att in value]
@@ -202,12 +209,15 @@ def search_airtable(query_conditions=None):
                     result[key] = value
             results.append(result)
         
+        print(f"Found {len(results)} Airtable records")
+        
         # Apply any filtering based on query_conditions
         if query_conditions:
             # Filter by state if specified
             if 'state' in query_conditions:
                 state_filter = query_conditions['state'].upper()
                 results = [r for r in results if r.get('State', '').upper() == state_filter]
+                print(f"After state filter: {len(results)} records")
             
             # Sort by date if needed
             if 'order_by' in query_conditions and query_conditions['order_by'] == 'date':
@@ -216,6 +226,7 @@ def search_airtable(query_conditions=None):
             # Limit results if specified
             if 'limit' in query_conditions:
                 results = results[:query_conditions['limit']]
+                print(f"After limit: {len(results)} records")
         
         return results
         
@@ -406,7 +417,7 @@ def execute_query(query_info):
         # Query Airtable with conditions
         conditions = query_info.get('conditions', {})
         results = search_airtable(conditions)
-        if results:
+        if results is not None:  # Check for None specifically, empty list is valid
             return results, None
         else:
             return [], "No Airtable data found or Airtable not configured"
