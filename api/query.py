@@ -116,8 +116,42 @@ def get_db_connection():
         
     # Check if we have all required environment variables
     required_vars = ['SQL_SERVER', 'SQL_DATABASE', 'SQL_USERNAME', 'SQL_PASSWORD']
-    if not all(os.environ.get(var) for var in required_vars):
-        print("Missing required SQL Server environment variables")
+    missing_vars = [var for var in required_vars if not os.environ.get(var)]
+    if missing_vars:
+        print(f"Missing SQL Server environment variables: {missing_vars}")
+        return None
+    
+    server = os.environ.get('SQL_SERVER')
+    database = os.environ.get('SQL_DATABASE')
+    username = os.environ.get('SQL_USERNAME')
+    password = os.environ.get('SQL_PASSWORD')
+    
+    print(f"Attempting SQL connection to: {server}/{database} as {username}")
+    
+    try:
+        conn = pymssql.connect(
+            server=server,
+            user=username,
+            password=password,
+            database=database,
+            charset='UTF-8',
+            as_dict=True,
+            login_timeout=30,
+            timeout=30
+        )
+        print("SQL Server connection successful!")
+        return conn
+    except pymssql.OperationalError as e:
+        print(f"OperationalError: {e}")
+        if "20002" in str(e):
+            print("Network error - check if server name is correct")
+        elif "18456" in str(e):
+            print("Login failed - check username/password")
+        elif "4060" in str(e):
+            print("Cannot open database - check database name")
+        return None
+    except Exception as e:
+        print(f"Unexpected error: {type(e).__name__}: {e}")
         return None
     
     try:
