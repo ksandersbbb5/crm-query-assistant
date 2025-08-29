@@ -1,3 +1,4 @@
+from http.server import BaseHTTPRequestHandler
 import requests
 import openai
 import os
@@ -227,85 +228,70 @@ def format_results(results, question):
     except Exception as e:
         return f"Results formatting error: {str(e)}"
 
-def handler(request):
-    """Main handler for Vercel serverless function"""
-    try:
-        # Handle CORS preflight
-        if hasattr(request, 'method') and request.method == 'OPTIONS':
-            return {
-                'statusCode': 200,
-                'headers': {
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-                    'Access-Control-Allow-Headers': 'Content-Type',
-                }
-            }
-        
-        # Parse request body
-        body = getattr(request, 'body', '{}')
-        if isinstance(body, bytes):
-            body = body.decode('utf-8')
-        
-        data = json.loads(body) if body and body != '{}' else {}
-        question = data.get('question', '')
-        
-        if not question:
-            return {
-                'statusCode': 400,
-                'headers': {
-                    'Access-Control-Allow-Origin': '*',
-                    'Content-Type': 'application/json'
-                },
-                'body': json.dumps({'error': 'No question provided'})
-            }
-        
-        # Process question
-        schema = get_database_schema()
-        sql_query = text_to_sql(question, schema)
-        
-        if sql_query.startswith('Error'):
-            return {
-                'statusCode': 500,
-                'headers': {
-                    'Access-Control-Allow-Origin': '*',
-                    'Content-Type': 'application/json'
-                },
-                'body': json.dumps({'error': sql_query})
-            }
-        
-        results, error = execute_sql_via_rest(sql_query)
-        
-        if error:
-            return {
-                'statusCode': 500,
-                'headers': {
-                    'Access-Control-Allow-Origin': '*',
-                    'Content-Type': 'application/json'
-                },
-                'body': json.dumps({'error': f'Database error: {error}', 'sql': sql_query})
-            }
-        
-        answer = format_results(results, question)
-        
-        return {
-            'statusCode': 200,
-            'headers': {
-                'Access-Control-Allow-Origin': '*',
-                'Content-Type': 'application/json'
-            },
-            'body': json.dumps({
+class handler(BaseHTTPRequestHandler):
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+
+    def do_POST(self):
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            
+            question = data.get('question', '')
+            
+            if not question:
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': 'No question provided'}).encode())
+                return
+            
+            # Process question
+            schema = get_database_schema()
+            sql_query = text_to_sql(question, schema)
+            
+            if sql_query.startswith('Error'):
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': sql_query}).encode())
+                return
+            
+            results, error = execute_sql_via_rest(sql_query)
+            
+            if error:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': f'Database error: {error}', 'sql': sql_query}).encode())
+                return
+            
+            answer = format_results(results, question)
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            
+            response = {
                 'answer': answer,
                 'sql': sql_query,
                 'results_count': len(results) if results else 0
-            })
-        }
-        
-    except Exception as e:
-        return {
-            'statusCode': 500,
-            'headers': {
-                'Access-Control-Allow-Origin': '*',
-                'Content-Type': 'application/json'
-            },
-            'body': json.dumps({'error': f'Server error: {str(e)}'})
-        }
+            }
+            
+            self.wfile.write(json.dumps(response).encode())
+            
+        except Exception as e:
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': f'Server error: {str(e)}'}).encode())
