@@ -4,6 +4,7 @@ import os
 import json
 import decimal
 import datetime
+import re
 
 # Try to import pymssql for SQL Server connection
 try:
@@ -71,12 +72,27 @@ Common States: MA, ME, VT, RI, NH, CT (New England states)
 
 def get_airtable_schema():
     """Get Airtable schema info"""
-    # TODO: Update this with your actual Airtable fields
     return """
-Airtable Table: [Your Table Name]
+Airtable Table: CREM Photos
 Fields:
-- Record ID: Unique identifier
-- [Add your Airtable fields here]
+- ID: Autonumber - Primary key
+- Date of Event: Date - When the event took place
+- Email Address: Lookup - Employee email from linked table
+- Employee First Name: Lookup - First name from employee table
+- Employee Last Name: Lookup - Last name from employee table
+- Employee Photo: Lookup - Employee photo from linked table
+- Employee Status: Lookup - Employment status from linked table
+- Event Name: Single line text - Name of the event
+- Photo: Attachment - Event photo file(s)
+- State: Single select - State where event took place (VT, MA, etc.)
+- Submitted by Employee: Link to another record - Employee who submitted
+- Team Member OLD: Single select - Legacy team member field
+
+Common queries:
+- Photos by state (VT, Vermont, MA, Massachusetts, etc.)
+- Event photos over time periods
+- Photo counts and statistics
+- Employee submissions
 """
 
 def get_combined_schema():
@@ -88,8 +104,8 @@ SQL SERVER DATA:
 AIRTABLE DATA:
 {get_airtable_schema()}
 
-When user asks about Airtable data, respond with type: "airtable"
-When user asks about applications/CRM data, use SQL queries
+When user asks about photos, events, CREM photos, or uses visualization terms (chart, table), consider using Airtable.
+When user asks about applications, invoices, or CRM data, use SQL Server.
 """
 
 def get_db_connection():
@@ -116,8 +132,39 @@ def get_db_connection():
         print(f"SQL Server connection error: {str(e)}")
         return None
 
+def parse_airtable_query(question):
+    """Parse Airtable-specific query parameters from the question"""
+    query_conditions = {}
+    question_lower = question.lower()
+    
+    # Check for state filters
+    state_abbrevs = {
+        'vermont': 'VT', 'vt': 'VT',
+        'massachusetts': 'MA', 'ma': 'MA', 
+        'maine': 'ME', 'me': 'ME',
+        'new hampshire': 'NH', 'nh': 'NH',
+        'rhode island': 'RI', 'ri': 'RI',
+        'connecticut': 'CT', 'ct': 'CT'
+    }
+    
+    for state_name, abbrev in state_abbrevs.items():
+        if state_name in question_lower:
+            query_conditions['state'] = abbrev
+            break
+    
+    # Check for numeric limits
+    numbers = re.findall(r'\b(\d+)\b', question)
+    if numbers and any(word in question_lower for word in ['past', 'last', 'top', 'first', 'recent']):
+        query_conditions['limit'] = int(numbers[0])
+    
+    # Check for sorting
+    if any(word in question_lower for word in ['recent', 'past', 'latest', 'last']):
+        query_conditions['order_by'] = 'date'
+    
+    return query_conditions
+
 def search_airtable(query_conditions=None):
-    """Search Airtable records"""
+    """Search Airtable records with filtering"""
     try:
         if not AIRTABLE_AVAILABLE:
             return []
@@ -136,7 +183,7 @@ def search_airtable(query_conditions=None):
             os.environ.get('AIRTABLE_TABLE_NAME')
         )
         
-        # Get all records (you can add filtering later)
+        # Get all records
         records = table.all()
         
         # Convert to consistent format
@@ -146,9 +193,30 @@ def search_airtable(query_conditions=None):
                 'record_id': record['id'], 
                 'source': 'airtable'
             }
-            result.update(record['fields'])
+            # Add all fields from the record
+            for key, value in record['fields'].items():
+                # Handle attachment fields specially
+                if key == 'Photo' and isinstance(value, list):
+                    result[key] = [att.get('url', '') for att in value]
+                else:
+                    result[key] = value
             results.append(result)
+        
+        # Apply any filtering based on query_conditions
+        if query_conditions:
+            # Filter by state if specified
+            if 'state' in query_conditions:
+                state_filter = query_conditions['state'].upper()
+                results = [r for r in results if r.get('State', '').upper() == state_filter]
             
+            # Sort by date if needed
+            if 'order_by' in query_conditions and query_conditions['order_by'] == 'date':
+                results.sort(key=lambda x: x.get('Date of Event', ''), reverse=True)
+            
+            # Limit results if specified
+            if 'limit' in query_conditions:
+                results = results[:query_conditions['limit']]
+        
         return results
         
     except Exception as e:
@@ -159,11 +227,14 @@ def text_to_sql(question, schema):
     """Convert question to SQL or determine if Airtable query needed"""
     try:
         # Check if question is about Airtable data
-        airtable_keywords = ['airtable', 'air table']  # Add your specific table name here
+        airtable_keywords = ['airtable', 'air table', 'photo', 'photos', 'crem photos', 'event photo', 'event', 'events']
         is_airtable_query = any(keyword in question.lower() for keyword in airtable_keywords)
         
+        # Parse potential Airtable query conditions
+        airtable_conditions = parse_airtable_query(question) if is_airtable_query else {}
+        
         if is_airtable_query:
-            return {"type": "airtable", "query": "all"}
+            return {"type": "airtable", "query": "filtered", "conditions": airtable_conditions}
         
         # For testing with mock data, use a dummy key if none is set
         if not openai.api_key:
@@ -193,7 +264,7 @@ def text_to_sql(question, schema):
 {schema}
 
 Rules:
-- If the question mentions Airtable or specific Airtable table names, return: "AIRTABLE_QUERY"
+- If the question mentions photos, events, CREM, or asks for charts/tables of photo data, return: "AIRTABLE_QUERY"
 - Otherwise, generate SQL Server query
 - Return ONLY the SQL query, no explanations or markdown
 - Use SQL Server syntax (TOP not LIMIT) 
@@ -220,7 +291,7 @@ Rules:
         
         # Check if response indicates Airtable
         if "AIRTABLE_QUERY" in sql or "airtable" in sql.lower():
-            return {"type": "airtable", "query": "all"}
+            return {"type": "airtable", "query": "filtered", "conditions": airtable_conditions}
         
         # Clean up the response (remove markdown formatting if present)
         if sql.startswith('```sql'):
@@ -332,8 +403,9 @@ def execute_sql_via_rest(sql_query):
 def execute_query(query_info):
     """Execute either SQL or Airtable query"""
     if isinstance(query_info, dict) and query_info.get('type') == 'airtable':
-        # Query Airtable
-        results = search_airtable()
+        # Query Airtable with conditions
+        conditions = query_info.get('conditions', {})
+        results = search_airtable(conditions)
         if results:
             return results, None
         else:
@@ -354,28 +426,37 @@ def format_results(results, question):
     try:
         # For testing without OpenAI key
         if not openai.api_key:
-            if len(results) == 1:
-                # Format single result nicely
+            question_lower = question.lower()
+            
+            # Handle count questions
+            if 'how many' in question_lower or 'count' in question_lower:
                 if 'count' in results[0]:
                     return f"The count is: {results[0]['count']:,}"
                 else:
-                    formatted = "Found 1 result:\n"
-                    for key, value in results[0].items():
-                        if key != 'source':  # Don't show source in output
-                            formatted += f"- {key}: {value}\n"
-                    return formatted.strip()
+                    return f"Found {len(results)} records."
+            
+            # Handle single result
+            if len(results) == 1:
+                formatted = "Found 1 result:\n"
+                for key, value in results[0].items():
+                    if key not in ['source', 'record_id']:  # Don't show internal fields
+                        formatted += f"- {key}: {value}\n"
+                return formatted.strip()
+            
+            # Handle multiple results
             else:
                 formatted = f"Found {len(results)} results:\n\n"
-                for i, result in enumerate(results[:3], 1):
+                for i, result in enumerate(results[:5], 1):
                     formatted += f"Result {i}:\n"
                     for key, value in result.items():
-                        if key != 'source':  # Don't show source in output
+                        if key not in ['source', 'record_id']:  # Don't show internal fields
                             formatted += f"- {key}: {value}\n"
                     formatted += "\n"
-                if len(results) > 3:
-                    formatted += f"... and {len(results) - 3} more results"
+                if len(results) > 5:
+                    formatted += f"... and {len(results) - 5} more results"
                 return formatted.strip()
         
+        # Use OpenAI to format results
         # Convert results to a readable format
         if len(results) == 1:
             result_text = f"Found 1 result: {results[0]}"
@@ -391,7 +472,7 @@ def format_results(results, question):
             messages=[
                 {
                     "role": "system",
-                    "content": "Format database query results into a clear, natural language answer. Be concise but informative."
+                    "content": "Format database query results into a clear, natural language answer. Be concise but informative. If the question asks for counts, provide the count. If it asks for specific data, list the relevant information."
                 },
                 {
                     "role": "user",
@@ -419,12 +500,6 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         """Handle GET requests for testing"""
         try:
-            if self.path == '/api/query/test':
-                # This won't work on Vercel, but keeping for local testing
-                self.send_response(404)
-                self.end_headers()
-                return
-                
             # Default GET response
             self.send_response(200)
             self.send_header('Content-Type', 'text/plain')
@@ -547,10 +622,8 @@ class handler(BaseHTTPRequestHandler):
             # Format results
             answer = format_results(results, question)
             
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
+            # Include raw results for visualization if it's a visualization request
+            include_raw = any(term in question.lower() for term in ['chart', 'table', 'show me', 'photo', 'photos'])
             
             response = {
                 'answer': answer,
@@ -558,6 +631,15 @@ class handler(BaseHTTPRequestHandler):
                 'sql': query_info.get('query', str(query_info)) if isinstance(query_info, dict) else query_info,
                 'results_count': len(results) if results else 0
             }
+            
+            # Add raw results for visualization (limit size to prevent huge responses)
+            if include_raw and results and len(results) < 1000:
+                response['raw_results'] = results
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
             
             self.wfile.write(json.dumps(response).encode())
             
