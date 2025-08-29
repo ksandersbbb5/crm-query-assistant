@@ -1,0 +1,1 @@
+# crm-query-assistant
