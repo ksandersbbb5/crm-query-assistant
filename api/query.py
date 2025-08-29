@@ -189,14 +189,18 @@ def search_airtable(query_conditions=None):
         # Try both the raw table name and URL-encoded version
         try:
             table = api.table(base_id, table_name)
-            records = table.all()
+            records = []
+            for page in table.iterate():
+                records.extend(page)
         except Exception as e:
             print(f"First attempt failed: {e}")
             # Try URL-encoded table name
             encoded_table_name = urllib.parse.quote(table_name)
             print(f"Trying encoded table name: {encoded_table_name}")
             table = api.table(base_id, encoded_table_name)
-            records = table.all()
+            records = []
+            for page in table.iterate():
+                records.extend(page)
         
         # Convert to consistent format
         results = []
@@ -239,7 +243,6 @@ def search_airtable(query_conditions=None):
     except Exception as e:
         print(f"Airtable error: {str(e)}")
         return []
-
 def text_to_sql(question, schema):
     """Convert question to SQL or determine if Airtable query needed"""
     try:
