@@ -559,3 +559,110 @@ class handler(BaseHTTPRequestHandler):
                     "sql_username": os.environ.get('SQL_USERNAME', 'Not Set'),
                     "sql_password": "***" if os.environ.get('SQL_PASSWORD') else "Not Set",
                     "airtable_api_key": "Set" if os.environ.get('AIRTABLE_API_KEY') else "Not Set",
+                    "airtable_base_id": os.environ.get('AIRTABLE_BASE_ID', 'Not Set'),
+                    "airtable_table": os.environ.get('AIRTABLE_TABLE_NAME', 'Not Set'),
+                    "openai_key": "Set" if os.environ.get('OPENAI_API_KEY') else "Not Set",
+                    "api_secret": "Set" if os.environ.get('MY_API_SECRET') else "Not Set",
+                    "sql_connection_test": "Not Tested",
+                    "airtable_connection_test": "Not Tested"
+                }
+                
+                # Test SQL connection
+                if MSSQL_AVAILABLE and all([
+                    os.environ.get('SQL_SERVER'),
+                    os.environ.get('SQL_DATABASE'),
+                    os.environ.get('SQL_USERNAME'),
+                    os.environ.get('SQL_PASSWORD')
+                ]):
+                    try:
+                        conn = get_db_connection()
+                        if conn:
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT COUNT(*) as count FROM Applications")
+                            result = cursor.fetchone()
+                            test_results["sql_connection_test"] = f"Success! Found {result['count']} records"
+                            cursor.close()
+                            conn.close()
+                        else:
+                            test_results["sql_connection_test"] = "Failed to create connection"
+                    except Exception as e:
+                        test_results["sql_connection_test"] = f"Error: {str(e)}"
+                
+                # Test Airtable connection
+                if AIRTABLE_AVAILABLE and all([
+                    os.environ.get('AIRTABLE_API_KEY'),
+                    os.environ.get('AIRTABLE_BASE_ID'),
+                    os.environ.get('AIRTABLE_TABLE_NAME')
+                ]):
+                    try:
+                        records = search_airtable()
+                        test_results["airtable_connection_test"] = f"Success! Found {len(records)} records"
+                    except Exception as e:
+                        test_results["airtable_connection_test"] = f"Error: {str(e)}"
+                
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps(test_results, indent=2).encode())
+                return
+            
+            # Regular question processing
+            question = data.get('question', '')
+            
+            if not question:
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': 'No question provided'}).encode())
+                return
+            
+            # Process question
+            schema = get_combined_schema()
+            query_info = text_to_sql(question, schema)
+            
+            # Execute query
+            results, error = execute_query(query_info)
+            
+            if error:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'error': f'Database error: {error}', 
+                    'query_info': query_info
+                }).encode())
+                return
+            
+            # Format results
+            answer = format_results(results, question)
+            
+            # Include raw results for visualization if it's a visualization request
+            include_raw = any(term in question.lower() for term in ['chart', 'table', 'show me', 'photo', 'photos'])
+            
+            response = {
+                'answer': answer,
+                'query_type': query_info.get('type', 'sql') if isinstance(query_info, dict) else 'sql',
+                'sql': query_info.get('query', str(query_info)) if isinstance(query_info, dict) else query_info,
+                'results_count': len(results) if results else 0
+            }
+            
+            # Add raw results for visualization (limit size to prevent huge responses)
+            if include_raw and results and len(results) < 1000:
+                response['raw_results'] = results
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            
+            self.wfile.write(json.dumps(response).encode())
+            
+        except Exception as e:
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': f'Server error: {str(e)}'}).encode())
