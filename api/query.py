@@ -5,13 +5,21 @@ import json
 import decimal
 import datetime
 
-# Try to import pyodbc for SQL Server connection
+# Try to import pymssql for SQL Server connection
 try:
-    import pyodbc
-    PYODBC_AVAILABLE = True
+    import pymssql
+    MSSQL_AVAILABLE = True
 except ImportError:
-    PYODBC_AVAILABLE = False
-    print("pyodbc not available - using mock data only")
+    MSSQL_AVAILABLE = False
+    print("pymssql not available - using mock data only")
+
+# Try to import pyairtable
+try:
+    from pyairtable import Api
+    AIRTABLE_AVAILABLE = True
+except ImportError:
+    AIRTABLE_AVAILABLE = False
+    print("pyairtable not available")
 
 # Configure OpenAI
 openai.api_key = os.environ.get('OPENAI_API_KEY')
@@ -61,9 +69,32 @@ Common States: MA, ME, VT, RI, NH, CT (New England states)
 """
     return schema_info
 
+def get_airtable_schema():
+    """Get Airtable schema info"""
+    # TODO: Update this with your actual Airtable fields
+    return """
+Airtable Table: [Your Table Name]
+Fields:
+- Record ID: Unique identifier
+- [Add your Airtable fields here]
+"""
+
+def get_combined_schema():
+    """Get both SQL and Airtable schemas"""
+    return f"""
+SQL SERVER DATA:
+{get_database_schema()}
+
+AIRTABLE DATA:
+{get_airtable_schema()}
+
+When user asks about Airtable data, respond with type: "airtable"
+When user asks about applications/CRM data, use SQL queries
+"""
+
 def get_db_connection():
-    """Create SQL Server connection"""
-    if not PYODBC_AVAILABLE:
+    """Create SQL Server connection using pymssql"""
+    if not MSSQL_AVAILABLE:
         return None
         
     # Check if we have all required environment variables
@@ -73,50 +104,97 @@ def get_db_connection():
         return None
     
     try:
-        connection_string = (
-            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-            f"SERVER={os.environ.get('SQL_SERVER')};"
-            f"DATABASE={os.environ.get('SQL_DATABASE')};"
-            f"UID={os.environ.get('SQL_USERNAME')};"
-            f"PWD={os.environ.get('SQL_PASSWORD')};"
-            f"TrustServerCertificate=yes;"
+        conn = pymssql.connect(
+            server=os.environ.get('SQL_SERVER'),
+            database=os.environ.get('SQL_DATABASE'),
+            user=os.environ.get('SQL_USERNAME'),
+            password=os.environ.get('SQL_PASSWORD'),
+            as_dict=True  # Return results as dictionaries
         )
-        return pyodbc.connect(connection_string)
+        return conn
     except Exception as e:
         print(f"SQL Server connection error: {str(e)}")
         return None
 
-def text_to_sql(question, schema):
-    """Convert question to SQL"""
+def search_airtable(query_conditions=None):
+    """Search Airtable records"""
     try:
+        if not AIRTABLE_AVAILABLE:
+            return []
+        
+        if not all([
+            os.environ.get('AIRTABLE_API_KEY'),
+            os.environ.get('AIRTABLE_BASE_ID'),
+            os.environ.get('AIRTABLE_TABLE_NAME')
+        ]):
+            print("Missing Airtable configuration")
+            return []
+            
+        api = Api(os.environ.get('AIRTABLE_API_KEY'))
+        table = api.table(
+            os.environ.get('AIRTABLE_BASE_ID'),
+            os.environ.get('AIRTABLE_TABLE_NAME')
+        )
+        
+        # Get all records (you can add filtering later)
+        records = table.all()
+        
+        # Convert to consistent format
+        results = []
+        for record in records:
+            result = {
+                'record_id': record['id'], 
+                'source': 'airtable'
+            }
+            result.update(record['fields'])
+            results.append(result)
+            
+        return results
+        
+    except Exception as e:
+        print(f"Airtable error: {str(e)}")
+        return []
+
+def text_to_sql(question, schema):
+    """Convert question to SQL or determine if Airtable query needed"""
+    try:
+        # Check if question is about Airtable data
+        airtable_keywords = ['airtable', 'air table']  # Add your specific table name here
+        is_airtable_query = any(keyword in question.lower() for keyword in airtable_keywords)
+        
+        if is_airtable_query:
+            return {"type": "airtable", "query": "all"}
+        
         # For testing with mock data, use a dummy key if none is set
         if not openai.api_key:
             # Return a simple SQL query for mock testing
             if "45874" in question:
-                return "SELECT * FROM Applications WHERE AppID = 45874"
+                return {"type": "sql", "query": "SELECT * FROM Applications WHERE AppID = 45874"}
             elif "count" in question.lower():
-                return "SELECT COUNT(*) as count FROM Applications"
+                return {"type": "sql", "query": "SELECT COUNT(*) as count FROM Applications"}
             elif "average" in question.lower() and "invoice" in question.lower():
-                return "SELECT rep, AVG(invoice_total) as avg_invoice FROM Applications GROUP BY rep ORDER BY avg_invoice DESC"
+                return {"type": "sql", "query": "SELECT rep, AVG(invoice_total) as avg_invoice FROM Applications GROUP BY rep ORDER BY avg_invoice DESC"}
             elif "rejected" in question.lower() or "denied" in question.lower():
-                return "SELECT * FROM Applications WHERE app_status IN ('Rejected/Denied') ORDER BY DateCreated DESC"
+                return {"type": "sql", "query": "SELECT * FROM Applications WHERE app_status IN ('Rejected/Denied') ORDER BY DateCreated DESC"}
             elif "balance" in question.lower():
-                return "SELECT * FROM Applications WHERE invoice_balance > 0 ORDER BY invoice_balance DESC"
+                return {"type": "sql", "query": "SELECT * FROM Applications WHERE invoice_balance > 0 ORDER BY invoice_balance DESC"}
             elif "top" in question.lower() and "cities" in question.lower():
-                return "SELECT TOP 10 city, COUNT(*) as count FROM Applications GROUP BY city ORDER BY count DESC"
+                return {"type": "sql", "query": "SELECT TOP 10 city, COUNT(*) as count FROM Applications GROUP BY city ORDER BY count DESC"}
             else:
-                return "SELECT TOP 5 * FROM Applications ORDER BY DateCreated DESC"
+                return {"type": "sql", "query": "SELECT TOP 5 * FROM Applications ORDER BY DateCreated DESC"}
         
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
                 {
                     "role": "system",
-                    "content": f"""Convert natural language to SQL Server queries for Azure SQL Database.
+                    "content": f"""Convert natural language to SQL Server queries or indicate if Airtable data is needed.
                     
 {schema}
 
 Rules:
+- If the question mentions Airtable or specific Airtable table names, return: "AIRTABLE_QUERY"
+- Otherwise, generate SQL Server query
 - Return ONLY the SQL query, no explanations or markdown
 - Use SQL Server syntax (TOP not LIMIT) 
 - Current year is 2025
@@ -130,8 +208,7 @@ Rules:
 - Common status values: 'Processed/Accepted', 'Rejected/Denied', 'Application Withdrawn'
 - For current year data: WHERE YEAR(DateCreated) = 2025
 - Always include reasonable TOP limits for large result sets (TOP 100 max)
-- Use single quotes for string values
-- Be careful with date formatting"""
+- Use single quotes for string values"""
                 },
                 {"role": "user", "content": question}
             ],
@@ -141,17 +218,21 @@ Rules:
         
         sql = response.choices[0].message.content.strip()
         
+        # Check if response indicates Airtable
+        if "AIRTABLE_QUERY" in sql or "airtable" in sql.lower():
+            return {"type": "airtable", "query": "all"}
+        
         # Clean up the response (remove markdown formatting if present)
         if sql.startswith('```sql'):
             sql = sql[6:-3]
         elif sql.startswith('```'):
             sql = sql[3:-3]
             
-        return sql.strip()
+        return {"type": "sql", "query": sql.strip()}
         
     except Exception as e:
         # Return a default query for testing
-        return "SELECT TOP 5 * FROM Applications ORDER BY DateCreated DESC"
+        return {"type": "sql", "query": "SELECT TOP 5 * FROM Applications ORDER BY DateCreated DESC"}
 
 def execute_sql_via_rest_mock(sql_query):
     """Execute SQL query using mock data for testing"""
@@ -167,63 +248,19 @@ def execute_sql_via_rest_mock(sql_query):
                     "city": "Roslindale",
                     "state": "MA",
                     "invoice_total": 642,
-                    "rep": "Cochrane, Valerie"
+                    "rep": "Cochrane, Valerie",
+                    "source": "sql_server"
                 }
             ]
         elif "COUNT" in sql_query.upper():
-            mock_results = [{"count": 20000}]
+            mock_results = [{"count": 20000, "source": "sql_server"}]
         elif "TOP" in sql_query.upper() and "city" in sql_query.lower():
             mock_results = [
-                {"city": "Boston", "count": 2500},
-                {"city": "Cambridge", "count": 1800},
-                {"city": "Worcester", "count": 1200},
-                {"city": "Springfield", "count": 800},
-                {"city": "Lowell", "count": 600}
-            ]
-        elif "rep" in sql_query.lower() and ("AVG" in sql_query.upper() or "average" in sql_query.lower()):
-            mock_results = [
-                {"rep": "Cochrane, Valerie", "avg_invoice": 625.50},
-                {"rep": "DeLuca, MaryJane", "avg_invoice": 615.75},
-                {"rep": "Padula, Denise", "avg_invoice": 595.25},
-                {"rep": "Better Business Bureau, Online", "avg_invoice": 542.80}
-            ]
-        elif "rejected" in sql_query.lower() or "denied" in sql_query.lower():
-            mock_results = [
-                {
-                    "AppID": 8783,
-                    "app_status": "Rejected/Denied",
-                    "dba": "Chiropractic Solutions, LLC",
-                    "city": "Framingham",
-                    "state": "MA",
-                    "rep": "Weinstein, Sheryl"
-                },
-                {
-                    "AppID": 721,
-                    "app_status": "Rejected/Denied", 
-                    "dba": "P&L Limousine",
-                    "city": "Dorchester",
-                    "state": "MA",
-                    "rep": "Better Business Bureau, Better"
-                }
-            ]
-        elif "balance" in sql_query.lower() and ">" in sql_query:
-            mock_results = [
-                {
-                    "AppID": 83068,
-                    "dba": "FDS Installers Inc",
-                    "city": "Wareham",
-                    "state": "MA",
-                    "invoice_balance": 581,
-                    "rep": "IABBB, Online"
-                },
-                {
-                    "AppID": 78763,
-                    "dba": "0136673821",
-                    "city": "New Bedford",
-                    "state": "MA",
-                    "invoice_balance": 281,
-                    "rep": "Better Business Bureau, Online"
-                }
+                {"city": "Boston", "count": 2500, "source": "sql_server"},
+                {"city": "Cambridge", "count": 1800, "source": "sql_server"},
+                {"city": "Worcester", "count": 1200, "source": "sql_server"},
+                {"city": "Springfield", "count": 800, "source": "sql_server"},
+                {"city": "Lowell", "count": 600, "source": "sql_server"}
             ]
         else:
             # Default sample results
@@ -235,7 +272,8 @@ def execute_sql_via_rest_mock(sql_query):
                     "city": "Boston",
                     "state": "MA",
                     "invoice_total": 500,
-                    "rep": "Sample Rep"
+                    "rep": "Sample Rep",
+                    "source": "sql_server"
                 }
             ]
         
@@ -249,7 +287,7 @@ def execute_sql_via_rest(sql_query):
     # Add debug logging
     print(f"Attempting to execute SQL: {sql_query}")
     print(f"SQL_SERVER env: {os.environ.get('SQL_SERVER', 'Not Set')}")
-    print(f"PYODBC Available: {PYODBC_AVAILABLE}")
+    print(f"MSSQL Available: {MSSQL_AVAILABLE}")
     
     # Try real SQL Server connection first
     conn = get_db_connection()
@@ -262,24 +300,19 @@ def execute_sql_via_rest(sql_query):
             # Execute the query
             cursor.execute(sql_query)
             
-            # Get column names
-            columns = [column[0] for column in cursor.description] if cursor.description else []
+            # Fetch all results (already as dictionaries due to as_dict=True)
+            results = cursor.fetchall()
             
-            # Fetch all results
-            results = []
-            for row in cursor.fetchall():
-                result_dict = {}
-                for i, column in enumerate(columns):
-                    value = row[i]
-                    # Handle different data types
+            # Convert any special types and add source
+            for result in results:
+                result['source'] = 'sql_server'
+                for key, value in list(result.items()):
                     if isinstance(value, decimal.Decimal):
-                        value = float(value)
+                        result[key] = float(value)
                     elif isinstance(value, datetime.datetime):
-                        value = value.isoformat()
+                        result[key] = value.isoformat()
                     elif isinstance(value, datetime.date):
-                        value = value.isoformat()
-                    result_dict[column] = value
-                results.append(result_dict)
+                        result[key] = value.isoformat()
             
             cursor.close()
             conn.close()
@@ -296,6 +329,23 @@ def execute_sql_via_rest(sql_query):
         print("No SQL connection available, using mock data")
         return execute_sql_via_rest_mock(sql_query)
 
+def execute_query(query_info):
+    """Execute either SQL or Airtable query"""
+    if isinstance(query_info, dict) and query_info.get('type') == 'airtable':
+        # Query Airtable
+        results = search_airtable()
+        if results:
+            return results, None
+        else:
+            return [], "No Airtable data found or Airtable not configured"
+    else:
+        # Handle as SQL query (backward compatible)
+        if isinstance(query_info, dict):
+            sql_query = query_info.get('query', '')
+        else:
+            sql_query = query_info
+        return execute_sql_via_rest(sql_query)
+
 def format_results(results, question):
     """Use LLM to format results into natural language answer"""
     if not results:
@@ -311,14 +361,16 @@ def format_results(results, question):
                 else:
                     formatted = "Found 1 result:\n"
                     for key, value in results[0].items():
-                        formatted += f"- {key}: {value}\n"
+                        if key != 'source':  # Don't show source in output
+                            formatted += f"- {key}: {value}\n"
                     return formatted.strip()
             else:
                 formatted = f"Found {len(results)} results:\n\n"
                 for i, result in enumerate(results[:3], 1):
                     formatted += f"Result {i}:\n"
                     for key, value in result.items():
-                        formatted += f"- {key}: {value}\n"
+                        if key != 'source':  # Don't show source in output
+                            formatted += f"- {key}: {value}\n"
                     formatted += "\n"
                 if len(results) > 3:
                     formatted += f"... and {len(results) - 3} more results"
@@ -361,52 +413,16 @@ class handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-API-Key')
         self.end_headers()
 
     def do_GET(self):
         """Handle GET requests for testing"""
         try:
             if self.path == '/api/query/test':
-                # Test database connection
-                test_results = {
-                    "pyodbc_available": PYODBC_AVAILABLE,
-                    "sql_server": os.environ.get('SQL_SERVER', 'Not Set'),
-                    "sql_database": os.environ.get('SQL_DATABASE', 'Not Set'),
-                    "sql_username": os.environ.get('SQL_USERNAME', 'Not Set'),
-                    "sql_password": "***" if os.environ.get('SQL_PASSWORD') else "Not Set",
-                    "openai_key": "Set" if os.environ.get('OPENAI_API_KEY') else "Not Set",
-                    "connection_test": "Not Tested"
-                }
-                
-                # Try to connect
-                if PYODBC_AVAILABLE and all([
-                    os.environ.get('SQL_SERVER'),
-                    os.environ.get('SQL_DATABASE'),
-                    os.environ.get('SQL_USERNAME'),
-                    os.environ.get('SQL_PASSWORD')
-                ]):
-                    try:
-                        conn = get_db_connection()
-                        if conn:
-                            cursor = conn.cursor()
-                            cursor.execute("SELECT COUNT(*) as count FROM Applications")
-                            result = cursor.fetchone()
-                            test_results["connection_test"] = f"Success! Found {result[0]} records"
-                            cursor.close()
-                            conn.close()
-                        else:
-                            test_results["connection_test"] = "Failed to create connection"
-                    except Exception as e:
-                        test_results["connection_test"] = f"Error: {str(e)}"
-                else:
-                    test_results["connection_test"] = "Missing configuration"
-                
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
+                # This won't work on Vercel, but keeping for local testing
+                self.send_response(404)
                 self.end_headers()
-                self.wfile.write(json.dumps(test_results, indent=2).encode())
                 return
                 
             # Default GET response
@@ -429,6 +445,77 @@ class handler(BaseHTTPRequestHandler):
             post_data = self.rfile.read(content_length)
             data = json.loads(post_data.decode('utf-8'))
             
+            # API Key Security Check (if enabled)
+            api_key = self.headers.get('X-API-Key') or data.get('api_key')
+            expected_key = os.environ.get('MY_API_SECRET')
+            
+            if expected_key and api_key != expected_key:
+                self.send_response(401)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': 'Unauthorized - Invalid API Key'}).encode())
+                return
+            
+            # Handle test request
+            if data.get('test') == True:
+                test_results = {
+                    "pymssql_available": MSSQL_AVAILABLE,
+                    "pyairtable_available": AIRTABLE_AVAILABLE,
+                    "sql_server": os.environ.get('SQL_SERVER', 'Not Set'),
+                    "sql_database": os.environ.get('SQL_DATABASE', 'Not Set'),
+                    "sql_username": os.environ.get('SQL_USERNAME', 'Not Set'),
+                    "sql_password": "***" if os.environ.get('SQL_PASSWORD') else "Not Set",
+                    "airtable_api_key": "Set" if os.environ.get('AIRTABLE_API_KEY') else "Not Set",
+                    "airtable_base_id": os.environ.get('AIRTABLE_BASE_ID', 'Not Set'),
+                    "airtable_table": os.environ.get('AIRTABLE_TABLE_NAME', 'Not Set'),
+                    "openai_key": "Set" if os.environ.get('OPENAI_API_KEY') else "Not Set",
+                    "api_secret": "Set" if os.environ.get('MY_API_SECRET') else "Not Set",
+                    "sql_connection_test": "Not Tested",
+                    "airtable_connection_test": "Not Tested"
+                }
+                
+                # Test SQL connection
+                if MSSQL_AVAILABLE and all([
+                    os.environ.get('SQL_SERVER'),
+                    os.environ.get('SQL_DATABASE'),
+                    os.environ.get('SQL_USERNAME'),
+                    os.environ.get('SQL_PASSWORD')
+                ]):
+                    try:
+                        conn = get_db_connection()
+                        if conn:
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT COUNT(*) as count FROM Applications")
+                            result = cursor.fetchone()
+                            test_results["sql_connection_test"] = f"Success! Found {result['count']} records"
+                            cursor.close()
+                            conn.close()
+                        else:
+                            test_results["sql_connection_test"] = "Failed to create connection"
+                    except Exception as e:
+                        test_results["sql_connection_test"] = f"Error: {str(e)}"
+                
+                # Test Airtable connection
+                if AIRTABLE_AVAILABLE and all([
+                    os.environ.get('AIRTABLE_API_KEY'),
+                    os.environ.get('AIRTABLE_BASE_ID'),
+                    os.environ.get('AIRTABLE_TABLE_NAME')
+                ]):
+                    try:
+                        records = search_airtable()
+                        test_results["airtable_connection_test"] = f"Success! Found {len(records)} records"
+                    except Exception as e:
+                        test_results["airtable_connection_test"] = f"Error: {str(e)}"
+                
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps(test_results, indent=2).encode())
+                return
+            
+            # Regular question processing
             question = data.get('question', '')
             
             if not question:
@@ -440,27 +527,24 @@ class handler(BaseHTTPRequestHandler):
                 return
             
             # Process question
-            schema = get_database_schema()
-            sql_query = text_to_sql(question, schema)
+            schema = get_combined_schema()
+            query_info = text_to_sql(question, schema)
             
-            if sql_query.startswith('Error'):
-                self.send_response(500)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(json.dumps({'error': sql_query}).encode())
-                return
-            
-            results, error = execute_sql_via_rest(sql_query)
+            # Execute query
+            results, error = execute_query(query_info)
             
             if error:
                 self.send_response(500)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(json.dumps({'error': f'Database error: {error}', 'sql': sql_query}).encode())
+                self.wfile.write(json.dumps({
+                    'error': f'Database error: {error}', 
+                    'query_info': query_info
+                }).encode())
                 return
             
+            # Format results
             answer = format_results(results, question)
             
             self.send_response(200)
@@ -470,7 +554,8 @@ class handler(BaseHTTPRequestHandler):
             
             response = {
                 'answer': answer,
-                'sql': sql_query,
+                'query_type': query_info.get('type', 'sql') if isinstance(query_info, dict) else 'sql',
+                'sql': query_info.get('query', str(query_info)) if isinstance(query_info, dict) else query_info,
                 'results_count': len(results) if results else 0
             }
             
