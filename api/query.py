@@ -1,10 +1,7 @@
-from flask import Flask, request, jsonify
-import pyodbc
+import pymssql
 import openai
 import os
 import json
-
-app = Flask(__name__)
 
 # Configure OpenAI
 openai.api_key = os.environ.get('OPENAI_API_KEY')
@@ -53,25 +50,6 @@ Common Status Values: "Processed/Accepted", "Rejected/Denied", "Application With
 Common States: MA, ME, VT, RI, NH, CT (New England states)
 """
     return schema_info
-        
-        cursor.execute(schema_query)
-        schema = cursor.fetchall()
-        
-        schema_text = "Database Schema:\n"
-        current_table = ""
-        
-        for row in schema:
-            table, column, data_type = row
-            if table != current_table:
-                current_table = table
-                schema_text += f"\nTable: {table}\n"
-            schema_text += f"  - {column} ({data_type})\n"
-        
-        conn.close()
-        return schema_text
-        
-    except Exception as e:
-        return f"Schema error: {str(e)}"
 
 def text_to_sql(question, schema):
     """Convert question to SQL"""
@@ -107,26 +85,35 @@ Rules:
         )
         
         sql = response.choices[0].message.content.strip()
-        if sql.startswith('```'):
-            sql = sql.split('\n')[1:-1]
-            sql = '\n'.join(sql)
         
-        return sql
+        # Clean up the response (remove markdown formatting if present)
+        if sql.startswith('```sql'):
+            sql = sql[6:-3]
+        elif sql.startswith('```'):
+            sql = sql[3:-3]
+            
+        return sql.strip()
         
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"Error generating SQL: {str(e)}"
 
 def execute_sql(sql_query):
-    """Execute SQL query"""
+    """Execute SQL query against the database"""
     try:
-        conn = pyodbc.connect(os.environ.get('SQL_SERVER_CONNECTION_STRING'))
-        cursor = conn.cursor()
+        conn = pymssql.connect(
+            server=os.environ.get('AZURE_SQL_SERVER'),
+            user=os.environ.get('AZURE_SQL_USERNAME'),
+            password=os.environ.get('AZURE_SQL_PASSWORD'),
+            database=os.environ.get('AZURE_SQL_DATABASE'),
+            port=1433,
+            login_timeout=60,
+            timeout=30
+        )
         
+        cursor = conn.cursor(as_dict=True)
         cursor.execute(sql_query)
-        columns = [col[0] for col in cursor.description]
-        rows = cursor.fetchall()
         
-        results = [dict(zip(columns, row)) for row in rows]
+        results = cursor.fetchall()
         
         conn.close()
         return results, None
@@ -135,20 +122,32 @@ def execute_sql(sql_query):
         return None, str(e)
 
 def format_results(results, question):
-    """Format results with LLM"""
+    """Use LLM to format results into natural language answer"""
     if not results:
-        return "No results found."
+        return "No results found for your question."
     
     try:
-        result_text = f"Found {len(results)} results:\n"
-        for i, result in enumerate(results[:10]):
-            result_text += f"{i+1}. {result}\n"
+        # Convert results to a readable format
+        if len(results) == 1:
+            result_text = f"Found 1 result: {results[0]}"
+        else:
+            result_text = f"Found {len(results)} results:\n"
+            for i, result in enumerate(results[:10]):  # Limit to first 10 results
+                result_text += f"{i+1}. {result}\n"
+            if len(results) > 10:
+                result_text += f"... and {len(results) - 10} more results"
         
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "Format database results into clear natural language."},
-                {"role": "user", "content": f"Question: {question}\n\nResults: {result_text}"}
+                {
+                    "role": "system",
+                    "content": "Format database query results into a clear, natural language answer. Be concise but informative."
+                },
+                {
+                    "role": "user",
+                    "content": f"Question: {question}\n\nResults: {result_text}\n\nPlease format this into a clear answer:"
+                }
             ],
             temperature=0.1,
             max_tokens=300
@@ -157,38 +156,80 @@ def format_results(results, question):
         return response.choices[0].message.content.strip()
         
     except Exception as e:
-        return f"Formatting error: {str(e)}"
+        return f"Results formatting error: {str(e)}"
 
 def handler(request):
-    if request.method == 'POST':
-        try:
-            data = request.get_json()
+    """Main handler for Vercel serverless function"""
+    try:
+        # Handle CORS preflight
+        if request.method == 'OPTIONS':
+            return {
+                'statusCode': 200,
+                'headers': {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type',
+                }
+            }
+        
+        if request.method == 'POST':
+            # Get request body
+            if hasattr(request, 'get_json'):
+                data = request.get_json()
+            else:
+                import json
+                data = json.loads(request.body)
+            
             question = data.get('question', '')
             
             if not question:
-                return jsonify({'error': 'No question provided'})
+                return {
+                    'statusCode': 400,
+                    'headers': {'Access-Control-Allow-Origin': '*'},
+                    'body': json.dumps({'error': 'No question provided'})
+                }
             
             # Process question
             schema = get_database_schema()
             sql_query = text_to_sql(question, schema)
             
             if sql_query.startswith('Error'):
-                return jsonify({'error': sql_query})
+                return {
+                    'statusCode': 500,
+                    'headers': {'Access-Control-Allow-Origin': '*'},
+                    'body': json.dumps({'error': sql_query})
+                }
             
             results, error = execute_sql(sql_query)
             
             if error:
-                return jsonify({'error': f'Database error: {error}', 'sql': sql_query})
+                return {
+                    'statusCode': 500,
+                    'headers': {'Access-Control-Allow-Origin': '*'},
+                    'body': json.dumps({'error': f'Database error: {error}', 'sql': sql_query})
+                }
             
             answer = format_results(results, question)
             
-            return jsonify({
-                'answer': answer,
-                'sql': sql_query,
-                'results_count': len(results) if results else 0
-            })
-            
-        except Exception as e:
-            return jsonify({'error': f'Server error: {str(e)}'})
-    
-    return jsonify({'error': 'Method not allowed'})
+            return {
+                'statusCode': 200,
+                'headers': {'Access-Control-Allow-Origin': '*'},
+                'body': json.dumps({
+                    'answer': answer,
+                    'sql': sql_query,
+                    'results_count': len(results) if results else 0
+                })
+            }
+        
+        return {
+            'statusCode': 405,
+            'headers': {'Access-Control-Allow-Origin': '*'},
+            'body': json.dumps({'error': 'Method not allowed'})
+        }
+        
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'headers': {'Access-Control-Allow-Origin': '*'},
+            'body': json.dumps({'error': f'Server error: {str(e)}'})
+        }
