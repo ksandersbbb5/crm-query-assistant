@@ -1,0 +1,3 @@
+pyodbc==4.0.39
+openai==0.28.1
+flask==2.3.3
