@@ -24,7 +24,7 @@ def _import_openai_optional():
     except Exception:
         return None
 
-API_VERSION = "2025-08-29-sys-test-safe-v3"
+API_VERSION = "2025-08-29-sys-test-safe-v3a"
 
 # -----------------------------
 # Environment
@@ -275,11 +275,11 @@ def aggregate_repeated_events(state: Optional[str] = None, min_count: int = 2, t
     return items[:top_n], len(rows)
 
 # -----------------------------
-# Intent detection
+# Intent detection (FIXED)
 # -----------------------------
 def is_employee_most_photos_intent(q: str) -> bool:
     ql = q.lower()
-    return ("employee" in ql) and (("most photos" in ql) or ("most pictures" in ql) or ("who has the most" in ql)))
+    return ("employee" in ql) and (("most photos" in ql) or ("most pictures" in ql) or ("who has the most" in ql))
 
 def is_event_repeats_intent(q: str) -> bool:
     ql = q.lower()
@@ -436,7 +436,7 @@ class handler(BaseHTTPRequestHandler):
             if data.get("debug") == "airtable":
                 # Optional tiny Airtable probe, but guarded
                 try:
-                    recs, _ = _airtable_list_records(page_size=1)
+                    recs, _ = _airtable_list_records(pageSize=1)  # intentionally small
                     sample = []
                     for r in recs:
                         before = (r.get("fields") or {}).copy()
