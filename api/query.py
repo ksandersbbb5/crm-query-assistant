@@ -10,7 +10,7 @@ from pyairtable import Table
 import pymssql
 from requests.exceptions import HTTPError
 
-API_VERSION = "2025-08-29-photos-normalized-v9"
+API_VERSION = "2025-08-29-photos-normalized-v10"
 
 # =============================
 # Environment Variables
@@ -26,8 +26,11 @@ AZURE_SQL_DB       = os.getenv("AZURE_SQL_DB")
 AZURE_SQL_USER     = os.getenv("AZURE_SQL_USER")
 AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
 
+# Tuning knobs
 DISABLE_AIRTABLE_SUMMARY = (os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true")
-AIRTABLE_SCAN_LIMIT = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))  # cap total rows to scan for aggregations
+AIRTABLE_DEFAULT_LIMIT   = int(os.getenv("AIRTABLE_DEFAULT_LIMIT", "50"))   # used when user doesn't specify N
+AIRTABLE_MAX_LIMIT       = int(os.getenv("AIRTABLE_MAX_LIMIT", "500"))     # cap for "all"
+AIRTABLE_SCAN_LIMIT      = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))    # used by aggregations
 
 openai.api_key = OPENAI_API_KEY
 
@@ -57,7 +60,6 @@ def _safe_to_str(val):
         return ""
 
 def _to_url_list(value):
-    """Coerce attachments to list[str] without using .startswith on unknown types."""
     urls = []
     if value is None:
         return urls
@@ -76,7 +78,6 @@ def _to_url_list(value):
     return urls
 
 def _normalize_photo_fields(fields: dict):
-    """Ensure photo fields are URL strings only; add first_photo_url."""
     candidates = ["Photo", "Photos", "Attachment", "Attachments", "Images", "Image"]
     found_urls = []
     for key in candidates:
@@ -90,7 +91,8 @@ def _normalize_photo_fields(fields: dict):
     fields["first_photo_url"] = found_urls[0] if found_urls else None
 
 def parse_state_and_limit(question: str):
-    """Find state and limit without confusing 'show me' with state ME."""
+    """Find state and limit; supports 'past|last N' and 'all'."""
+    # Prefer 'from|in <state>'
     m = re.search(
         r"\b(?:from|in)\s+(massachusetts|maine|rhode island|vermont|ma|me|ri|vt)\b",
         question,
@@ -100,22 +102,33 @@ def parse_state_and_limit(question: str):
     if m:
         state = STATE_NAME_TO_CODE[m.group(1).lower()]
 
+    # Fallback ALL-CAPS
     if not state:
         m2 = re.search(r"\b(MA|ME|RI|VT)\b", question)
         if m2:
             state = m2.group(1).upper()
 
-    limit = 10
-    m3 = re.search(r"\b(past|last)\s+(\d+)", question, flags=re.IGNORECASE)
+    # Limit: explicit number
+    limit = None
+    m3 = re.search(r"\b(past|last|first|top)\s+(\d+)", question, flags=re.IGNORECASE)
     if m3:
         try:
-            limit = max(1, min(100, int(m3.group(2))))
+            limit = int(m3.group(2))
         except Exception:
             pass
+
+    # 'all' keyword
+    if re.search(r"\ball\b", question, flags=re.IGNORECASE):
+        limit = AIRTABLE_MAX_LIMIT
+
+    if limit is None:
+        limit = AIRTABLE_DEFAULT_LIMIT
+
+    # clamp
+    limit = max(1, min(AIRTABLE_MAX_LIMIT, limit))
     return state, limit
 
 def _discover_columns():
-    """Fetch 1 record (no formula) to see what columns exist."""
     try:
         recs = _airtable.all(max_records=1) if _airtable else []
         if recs:
@@ -125,8 +138,7 @@ def _discover_columns():
         pass
     return set()
 
-def get_airtable_photos(state=None, limit=10):
-    """Fetch Airtable rows, normalized to URL strings. Auto-detects real field names for filters."""
+def get_airtable_photos(state=None, limit=AIRTABLE_DEFAULT_LIMIT):
     if not _airtable:
         return []
 
@@ -139,7 +151,7 @@ def get_airtable_photos(state=None, limit=10):
             clauses = [f'UPPER({{{f}}})="{state}"' for f in usable]
             formula = "OR(" + ",".join(clauses) + ")"
 
-    sort = ["-Date of Event"]  # adjust if your base uses a different field
+    sort = ["-Date of Event"]
 
     try:
         records = _airtable.all(formula=formula, sort=sort, max_records=limit)
@@ -157,13 +169,8 @@ def get_airtable_photos(state=None, limit=10):
     return rows
 
 def fetch_airtable_records_for_aggregation(state=None, max_scan=AIRTABLE_SCAN_LIMIT):
-    """
-    Pull a larger window of records for aggregation (e.g., top employees).
-    Applies state filter if we can build a valid formula; otherwise scans unfiltered.
-    """
     if not _airtable:
         return []
-
     formula = None
     if state and state in STATE_CODES:
         existing = _discover_columns()
@@ -172,10 +179,7 @@ def fetch_airtable_records_for_aggregation(state=None, max_scan=AIRTABLE_SCAN_LI
         if usable:
             clauses = [f'UPPER({{{f}}})="{state}"' for f in usable]
             formula = "OR(" + ",".join(clauses) + ")"
-
     sort = ["-Date of Event"]
-
-    # Pull up to max_scan rows (Airtable all() will respect max_records)
     try:
         records = _airtable.all(formula=formula, sort=sort, max_records=max_scan)
     except HTTPError as http_err:
@@ -183,7 +187,6 @@ def fetch_airtable_records_for_aggregation(state=None, max_scan=AIRTABLE_SCAN_LI
             records = _airtable.all(sort=sort, max_records=max_scan)
         else:
             raise
-
     rows = []
     for rec in records:
         fields = rec.get("fields", {}) or {}
@@ -192,12 +195,8 @@ def fetch_airtable_records_for_aggregation(state=None, max_scan=AIRTABLE_SCAN_LI
     return rows
 
 def _extract_employee_name(fields: dict):
-    """
-    Your base has Employee First/Last Name as arrays (lookup) in some rows.
-    Accept either string or [string]. Fallback to 'Submitted by Employee' id.
-    """
     first = fields.get("Employee First Name")
-    last = fields.get("Employee Last Name")
+    last  = fields.get("Employee Last Name")
 
     def _first_string(x):
         if isinstance(x, list) and x:
@@ -209,7 +208,6 @@ def _extract_employee_name(fields: dict):
     if f or l:
         return (l + ", " + f).strip(", ").strip()
 
-    # Fallback: use submitter record id
     sub = fields.get("Submitted by Employee")
     if isinstance(sub, list) and sub:
         return f"(Employee {sub[0]})"
@@ -220,7 +218,6 @@ def aggregate_top_employees(state=None, top_n=10):
     counter = Counter()
     for r in rows:
         name = _extract_employee_name(r)
-        # Count one per record that actually has at least one photo URL
         photos = r.get("Photo") or []
         if isinstance(photos, list) and photos:
             counter[name] += 1
@@ -228,7 +225,7 @@ def aggregate_top_employees(state=None, top_n=10):
     return top, len(rows)
 
 # =============================
-# Azure SQL Adapter (unchanged)
+# SQL (unchanged)
 # =============================
 def run_sql(sql: str):
     conn = None
@@ -252,9 +249,6 @@ def run_sql(sql: str):
         except Exception:
             pass
 
-# =============================
-# Config Status
-# =============================
 def config_status():
     return {
         "api_version": API_VERSION,
@@ -262,12 +256,11 @@ def config_status():
         "sql_configured": bool(AZURE_SQL_SERVER and AZURE_SQL_DB and AZURE_SQL_USER and AZURE_SQL_PASSWORD),
         "openai_configured": bool(OPENAI_API_KEY),
         "disable_airtable_summary": DISABLE_AIRTABLE_SUMMARY,
+        "airtable_default_limit": AIRTABLE_DEFAULT_LIMIT,
+        "airtable_max_limit": AIRTABLE_MAX_LIMIT,
         "airtable_scan_limit": AIRTABLE_SCAN_LIMIT,
     }
 
-# =============================
-# SQL Safety (read-only)
-# =============================
 _SQL_BLOCKLIST = re.compile(
     r"(;|--|/\*|\*/|\\x| drop | alter | delete | insert | update | merge | exec | execute | xp_| sp_)",
     flags=re.IGNORECASE,
@@ -282,9 +275,6 @@ def is_safe_select(sql: str) -> bool:
         return False
     return True
 
-# =============================
-# LLM Helpers (SQL only)
-# =============================
 def llm_generate_sql(question: str, schema_hint: str = "") -> str:
     if not OPENAI_API_KEY:
         return "SELECT TOP 10 * FROM INFORMATION_SCHEMA.TABLES"
@@ -327,16 +317,10 @@ def llm_format_answer(question: str, sample_rows: list) -> str:
     )
     return resp.choices[0].message.content.strip()
 
-# =============================
-# Intent detection (Airtable)
-# =============================
 def is_employee_most_photos_intent(q: str) -> bool:
     ql = q.lower()
     return ("employee" in ql) and (("most photos" in ql) or ("most pictures" in ql) or ("who has the most" in ql))
 
-# =============================
-# HTTP Handler
-# =============================
 class handler(BaseHTTPRequestHandler):
     def _send(self, status: int, payload: dict):
         body = json.dumps(payload).encode()
@@ -393,7 +377,7 @@ class handler(BaseHTTPRequestHandler):
             if use_airtable:
                 state, limit = parse_state_and_limit(question)
 
-                # INTENT: Which employee has the most photos?
+                # Intent: top employee by photos
                 if is_employee_most_photos_intent(question):
                     try:
                         top, scanned = aggregate_top_employees(state=state, top_n=10)
@@ -413,11 +397,11 @@ class handler(BaseHTTPRequestHandler):
                         "answer": ans,
                         "query_type": "airtable",
                         "sql": None,
-                        "raw_results": [],  # not needed for this intent
+                        "raw_results": [],  # not needed here
                         "results_count": scanned
                     })
 
-                # Default Airtable path (e.g., photos grid queries)
+                # Default Airtable path: fetch photos
                 try:
                     rows = get_airtable_photos(state=state, limit=limit)
                 except Exception as inner_e:
@@ -434,7 +418,7 @@ class handler(BaseHTTPRequestHandler):
                     "answer": answer,
                     "query_type": "airtable",
                     "sql": None,
-                    "raw_results": rows[:10],
+                    "raw_results": rows,            # NO TRUNCATION
                     "results_count": len(rows),
                 })
 
