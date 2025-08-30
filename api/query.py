@@ -2,7 +2,7 @@ import os
 import json
 import re
 import traceback
-from collections import Counter
+from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import quote as urlquote
 
@@ -12,7 +12,7 @@ import pymssql
 import requests
 from requests.exceptions import HTTPError
 
-API_VERSION = "2025-08-29-airtable-paging-v11"
+API_VERSION = "2025-08-29-airtable-paging-v12"
 
 # =============================
 # Environment Variables
@@ -29,11 +29,11 @@ AZURE_SQL_USER     = os.getenv("AZURE_SQL_USER")
 AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
 
 # Tuning knobs
-DISABLE_AIRTABLE_SUMMARY = (os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true")
-AIRTABLE_DEFAULT_LIMIT   = int(os.getenv("AIRTABLE_DEFAULT_LIMIT", "50"))   # fallback when user doesn't specify N
-AIRTABLE_MAX_LIMIT       = int(os.getenv("AIRTABLE_MAX_LIMIT", "5000"))     # overall cap for "all" (paging handles it)
-AIRTABLE_SCAN_LIMIT      = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))    # used by aggregations
-AIRTABLE_PAGE_SIZE_DEFAULT = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50"))  # per-page size (1..100)
+DISABLE_AIRTABLE_SUMMARY     = (os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true")
+AIRTABLE_DEFAULT_LIMIT       = int(os.getenv("AIRTABLE_DEFAULT_LIMIT", "50"))    # fallback when user doesn't specify N
+AIRTABLE_MAX_LIMIT           = int(os.getenv("AIRTABLE_MAX_LIMIT", "5000"))      # overall cap for "all" (paging handles it)
+AIRTABLE_SCAN_LIMIT          = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))     # used by aggregations
+AIRTABLE_PAGE_SIZE_DEFAULT   = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50"))# per-page size (1..100)
 
 openai.api_key = OPENAI_API_KEY
 
@@ -156,7 +156,6 @@ def _build_formula_for_state(state: str):
 def _airtable_sort_params(sort_list):
     """
     Convert ["-Date of Event","Name"] → params sort[0][field], sort[0][direction], ...
-    Airtable REST expects this structure; we'll send via requests.
     """
     params = {}
     idx = 0
@@ -259,6 +258,70 @@ def aggregate_top_employees(state=None, top_n=10):
     top = counter.most_common(top_n)
     return top, len(rows)
 
+def aggregate_counts_by_state(state=None, top_n=None):
+    rows = fetch_airtable_records_for_aggregation(state=state, max_scan=AIRTABLE_SCAN_LIMIT)
+    counter = Counter()
+    for r in rows:
+        photos = r.get("Photo") or []
+        if isinstance(photos, list) and photos:
+            st = r.get("State") or r.get("state") or ""
+            if isinstance(st, list) and st:
+                st = st[0]
+            st = (st or "Unknown").strip()
+            counter[st] += 1
+    items = counter.most_common(top_n) if top_n else counter.most_common()
+    labels = [k for k, _ in items]
+    data   = [v for _, v in items]
+    return labels, data, sum(counter.values())
+
+def aggregate_counts_by_employee_last_name(state=None, top_n=None):
+    rows = fetch_airtable_records_for_aggregation(state=state, max_scan=AIRTABLE_SCAN_LIMIT)
+    counter = Counter()
+    for r in rows:
+        photos = r.get("Photo") or []
+        if isinstance(photos, list) and photos:
+            last = r.get("Employee Last Name")
+            if isinstance(last, list) and last:
+                last = last[0]
+            last = (last or "Unknown").strip()
+            counter[last] += 1
+    items = counter.most_common(top_n) if top_n else counter.most_common()
+    labels = [k for k, _ in items]
+    data   = [v for _, v in items]
+    return labels, data, sum(counter.values())
+
+def aggregate_repeated_events(state=None, min_count=2, top_n=25):
+    rows = fetch_airtable_records_for_aggregation(state=state, max_scan=AIRTABLE_SCAN_LIMIT)
+    groups = defaultdict(lambda: {"count": 0, "states": Counter(), "dates": []})
+    for r in rows:
+        name = (r.get("Event Name") or "").strip()
+        if not name:
+            continue
+        groups[name]["count"] += 1
+        st = r.get("State") or r.get("state") or ""
+        if isinstance(st, list) and st:
+            st = st[0]
+        st = (st or "").strip()
+        if st:
+            groups[name]["states"][st] += 1
+        date = r.get("Date of Event")
+        if isinstance(date, str) and date:
+            groups[name]["dates"].append(date)
+
+    items = []
+    for name, g in groups.items():
+        if g["count"] >= min_count:
+            states_sorted = sorted(g["states"].items(), key=lambda x: (-x[1], x[0]))
+            items.append({
+                "event_name": name,
+                "count": g["count"],
+                "top_states": [f"{s} ({c})" for s, c in states_sorted[:3]],
+                "first_date": min(g["dates"]) if g["dates"] else None,
+                "last_date": max(g["dates"]) if g["dates"] else None
+            })
+    items.sort(key=lambda x: (-x["count"], x["event_name"]))
+    return items[:top_n], len(rows)
+
 # =============================
 # SQL (unchanged)
 # =============================
@@ -311,6 +374,9 @@ def is_safe_select(sql: str) -> bool:
         return False
     return True
 
+# =============================
+# LLM (SQL only)
+# =============================
 def llm_generate_sql(question: str, schema_hint: str = "") -> str:
     if not OPENAI_API_KEY:
         return "SELECT TOP 10 * FROM INFORMATION_SCHEMA.TABLES"
@@ -353,10 +419,28 @@ def llm_format_answer(question: str, sample_rows: list) -> str:
     )
     return resp.choices[0].message.content.strip()
 
+# =============================
+# Intent detection (Airtable)
+# =============================
 def is_employee_most_photos_intent(q: str) -> bool:
     ql = q.lower()
-    return ("employee" in ql) and (("most photos" in ql) or ("most pictures" in ql) or ("who has the most" in ql))
+    return ("employee" in ql) and (("most photos" in ql) or ("most pictures" in ql) or ("who has the most" in ql)))
 
+def is_event_repeats_intent(q: str) -> bool:
+    ql = q.lower()
+    return ("event" in ql) and (("more than once" in ql) or ("repeated" in ql) or ("duplicates" in ql) or ("duplicate" in ql))
+
+def is_bar_chart_by_state_intent(q: str) -> bool:
+    ql = q.lower()
+    return ("bar chart" in ql) and (("by state" in ql) or ("state" in ql))
+
+def is_bar_chart_by_employee_last_intent(q: str) -> bool:
+    ql = q.lower()
+    return ("bar chart" in ql) and (("employee last name" in ql) or ("by employee" in ql))
+
+# =============================
+# HTTP Handler
+# =============================
 class handler(BaseHTTPRequestHandler):
     def _send(self, status: int, payload: dict):
         body = json.dumps(payload).encode()
@@ -407,7 +491,7 @@ class handler(BaseHTTPRequestHandler):
             return self._send(400, {"error":"Missing 'question'"})
 
         ql = question.lower()
-        use_airtable = ("photo" in ql) or ("airtable" in ql)
+        use_airtable = ("photo" in ql) or ("airtable" in ql) or ("event" in ql)
 
         try:
             if use_airtable:
@@ -438,7 +522,64 @@ class handler(BaseHTTPRequestHandler):
                         "next_cursor": None
                     })
 
-                # Paged photo listing
+                # Intent: repeated events
+                if is_event_repeats_intent(question):
+                    try:
+                        items, scanned = aggregate_repeated_events(state=state, min_count=2, top_n=25)
+                    except Exception as inner_e:
+                        tb = traceback.format_exc()
+                        return self._send(500, {"error": str(inner_e), "trace": tb, "context": {"state": state}})
+                    if not items:
+                        ans = "No events were found more than once."
+                    else:
+                        ans = f"Found {len(items)} events that occurred more than once."
+                    return self._send(200, {
+                        "answer": ans,
+                        "query_type": "airtable",
+                        "sql": None,
+                        "aggregations": {"type": "event_repeats", "items": items},
+                        "raw_results": [],
+                        "results_count": scanned,
+                        "next_cursor": None
+                    })
+
+                # Intent: bar chart by state
+                if is_bar_chart_by_state_intent(question):
+                    labels, data_points, total = aggregate_counts_by_state(state=state)
+                    ans = f"Photo counts by state (total {total})."
+                    return self._send(200, {
+                        "answer": ans,
+                        "query_type": "airtable",
+                        "sql": None,
+                        "chart": {
+                            "type": "bar",
+                            "labels": labels,
+                            "datasets": [{"label": "Photos", "data": data_points}]
+                        },
+                        "raw_results": [],
+                        "results_count": total,
+                        "next_cursor": None
+                    })
+
+                # Intent: bar chart by employee last name
+                if is_bar_chart_by_employee_last_intent(question):
+                    labels, data_points, total = aggregate_counts_by_employee_last_name(state=state)
+                    ans = f"Photo counts by employee last name (total {total})."
+                    return self._send(200, {
+                        "answer": ans,
+                        "query_type": "airtable",
+                        "sql": None,
+                        "chart": {
+                            "type": "bar",
+                            "labels": labels,
+                            "datasets": [{"label": "Photos", "data": data_points}]
+                        },
+                        "raw_results": [],
+                        "results_count": total,
+                        "next_cursor": None
+                    })
+
+                # Default: paged photo listing
                 cursor = data.get("cursor") or None
                 page_size = data.get("page_size")
                 try:
@@ -446,8 +587,6 @@ class handler(BaseHTTPRequestHandler):
                     ps = max(1, min(100, int(page_size))) if page_size else ps_default
                 except Exception:
                     ps = max(1, min(100, AIRTABLE_PAGE_SIZE_DEFAULT))
-
-                # If user asked for fewer than default, respect that
                 ps = min(ps, overall_limit)
 
                 try:
@@ -456,7 +595,6 @@ class handler(BaseHTTPRequestHandler):
                     tb = traceback.format_exc()
                     return self._send(500, {"error": str(inner_e), "trace": tb, "context": {"state": state, "page_size": ps, "cursor": cursor}})
 
-                # Plain answer (LLM off)
                 human_state = state or "any state"
                 more = " (more available)" if next_cursor else ""
                 answer = f"Returned {len(rows)} photos from {human_state}{more}."
