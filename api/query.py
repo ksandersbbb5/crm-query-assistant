@@ -7,8 +7,9 @@ from http.server import BaseHTTPRequestHandler
 import openai
 from pyairtable import Table
 import pymssql
+from requests.exceptions import HTTPError
 
-API_VERSION = "2025-08-29-photos-normalized-v7"
+API_VERSION = "2025-08-29-photos-normalized-v8"
 
 # =============================
 # Environment Variables
@@ -24,7 +25,6 @@ AZURE_SQL_DB       = os.getenv("AZURE_SQL_DB")
 AZURE_SQL_USER     = os.getenv("AZURE_SQL_USER")
 AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
 
-# Keep summaries off for Airtable while we harden things
 DISABLE_AIRTABLE_SUMMARY = (os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true")
 
 openai.api_key = OPENAI_API_KEY
@@ -69,7 +69,7 @@ def _to_url_list(value):
         elif isinstance(x, str):
             u = x
         u = _safe_to_str(u)
-        if u and (u[:4].lower() == "http"):  # safe check
+        if u and (u[:4].lower() == "http"):
             urls.append(u)
     return urls
 
@@ -89,7 +89,6 @@ def _normalize_photo_fields(fields: dict):
 
 def parse_state_and_limit(question: str):
     """Find state and limit without confusing 'show me' with state ME."""
-    # 1) Prefer 'from|in <state>' patterns
     m = re.search(
         r"\b(?:from|in)\s+(massachusetts|maine|rhode island|vermont|ma|me|ri|vt)\b",
         question,
@@ -99,13 +98,11 @@ def parse_state_and_limit(question: str):
     if m:
         state = STATE_NAME_TO_CODE[m.group(1).lower()]
 
-    # 2) Fallback to bare two-letter codes that are ALL CAPS (avoids 'me' in 'show me')
     if not state:
         m2 = re.search(r"\b(MA|ME|RI|VT)\b", question)
         if m2:
             state = m2.group(1).upper()
 
-    # Limit
     limit = 10
     m3 = re.search(r"\b(past|last)\s+(\d+)", question, flags=re.IGNORECASE)
     if m3:
@@ -115,26 +112,45 @@ def parse_state_and_limit(question: str):
             pass
     return state, limit
 
+def _discover_columns():
+    """Fetch 1 record (no formula) to see what columns exist."""
+    try:
+        recs = _airtable.all(max_records=1) if _airtable else []
+        if recs:
+            fields = recs[0].get("fields", {}) or {}
+            return set(fields.keys())
+    except Exception:
+        pass
+    return set()
+
 def get_airtable_photos(state=None, limit=10):
-    """Fetch Airtable rows, normalized to URL strings."""
+    """Fetch Airtable rows, normalized to URL strings. Auto-detects real field names for filters."""
     if not _airtable:
         return []
 
+    # Build formula only using columns that actually exist
     formula = None
     if state and state in STATE_CODES:
-        # Try a few field names your base might use
-        name_variants = ["State", "state", "State Abbrev", "State Code"]
-        clauses = [f'UPPER({{{f}}})="{state}"' for f in name_variants]
-        formula = "OR(" + ",".join(clauses) + ")"
+        existing = _discover_columns()
+        # Try common variants, then only keep ones present
+        candidates = ["State", "state", "State Abbrev", "State Code"]
+        usable = [f for f in candidates if f in existing]
+        if usable:
+            clauses = [f'UPPER({{{f}}})="{state}"' for f in usable]
+            formula = "OR(" + ",".join(clauses) + ")"
 
-    # IMPORTANT: pyairtable expects sort as strings, not dicts
-    sort = ["-Date of Event"]  # descending by date; change field name if your base differs
+    # Sort newest first. pyairtable expects strings like "-Field Name"
+    sort = ["-Date of Event"]  # adjust if your base uses a different field
 
-    records = _airtable.all(
-        formula=formula,      # correct kwarg for pyairtable 2.2.x
-        sort=sort,            # FIXED: use strings like "-Field Name"
-        max_records=limit
-    )
+    # Try with formula first; if Airtable rejects it (422), retry without formula.
+    try:
+        records = _airtable.all(formula=formula, sort=sort, max_records=limit)
+    except HTTPError as http_err:
+        # If it's a formula error, retry without any filter (still sorted & limited)
+        if hasattr(http_err.response, "status_code") and http_err.response.status_code == 422:
+            records = _airtable.all(sort=sort, max_records=limit)
+        else:
+            raise
 
     rows = []
     for rec in records:
@@ -308,7 +324,6 @@ class handler(BaseHTTPRequestHandler):
         if not question:
             return self._send(400, {"error":"Missing 'question'"})
 
-        # Decide Airtable vs SQL
         ql = question.lower()
         use_airtable = ("photo" in ql) or ("airtable" in ql)
 
