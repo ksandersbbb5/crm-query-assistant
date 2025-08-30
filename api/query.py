@@ -7,9 +7,9 @@ import openai
 from pyairtable import Table
 import pymssql
 
-# -----------------------------
-# Env Vars (AZURE_* and AIRTABLE_*)
-# -----------------------------
+# =============================
+# Environment Variables
+# =============================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 AIRTABLE_API_KEY    = os.getenv("AIRTABLE_API_KEY")
@@ -23,9 +23,9 @@ AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
 
 openai.api_key = OPENAI_API_KEY
 
-# -----------------------------
-# Airtable adapter
-# -----------------------------
+# =============================
+# Airtable Adapter + Helpers
+# =============================
 _airtable = None
 if AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME:
     try:
@@ -34,6 +34,52 @@ if AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME:
         _airtable = None
 
 STATE_CODES = {"MA", "ME", "RI", "VT"}
+
+def _to_url_list(value):
+    """
+    Coerce Airtable attachment fields into a list of URL strings only.
+    Accepts:
+      - list of dicts with {'url': ...}
+      - list of strings
+      - single dict or single string
+    Returns: list[str]
+    """
+    urls = []
+    if not value:
+        return urls
+    items = value if isinstance(value, list) else [value]
+    for x in items:
+        if isinstance(x, str):
+            if x.startswith("http"):
+                urls.append(x)
+        elif isinstance(x, dict):
+            u = x.get("url")
+            if isinstance(u, str) and u.startswith("http"):
+                urls.append(u)
+    return urls
+
+def _normalize_photo_fields(fields):
+    """
+    Mutates `fields` so that any common photo/attachment field contains only URLs.
+    Also sets `first_photo_url` for convenience.
+    """
+    # Try common attachment field names you might have
+    candidates = ["Photo", "Photos", "Attachment", "Attachments", "Images", "Image"]
+    found_urls = []
+
+    for key in candidates:
+        if key in fields:
+            urls = _to_url_list(fields.get(key))
+            fields[key] = urls
+            if not found_urls and urls:
+                found_urls = urls
+
+    # For backward compatibility: ensure `Photo` exists and is a list[str]
+    if "Photo" not in fields:
+        fields["Photo"] = found_urls
+
+    # Convenience for old UIs that expect a single URL:
+    fields["first_photo_url"] = found_urls[0] if found_urls else None
 
 def parse_state_and_limit(question: str):
     ql = question.lower()
@@ -53,21 +99,23 @@ def parse_state_and_limit(question: str):
     return state, limit
 
 def get_airtable_photos(state=None, limit=10):
-    """Fetch Airtable photo rows, normalized to Photo URLs."""
+    """Fetch Airtable rows, normalizing all photo/attachment fields to URL strings."""
     if not _airtable:
         return []
 
+    # Build formula using DOUBLE quotes
     formula = None
-    if state:
-        # Try multiple field name variants for safety
-        candidates = ["State", "state", "State Abbrev", "State Code"]
-        clauses = [f'UPPER({{{f}}})="{state}"' for f in candidates]
+    if state and state in STATE_CODES:
+        # Try several field name variants to match your base
+        name_variants = ["State", "state", "State Abbrev", "State Code"]
+        clauses = [f'UPPER({{{f}}})="{state}"' for f in name_variants]
         formula = "OR(" + ",".join(clauses) + ")"
 
+    # Sort newest by a typical date field (adjust as needed)
     sorts = [{"field": "Date of Event", "direction": "desc"}]
 
     records = _airtable.all(
-        formula=formula,
+        formula=formula,   # correct kwarg for pyairtable 2.2.x
         sort=sorts,
         max_records=limit
     )
@@ -75,20 +123,28 @@ def get_airtable_photos(state=None, limit=10):
     rows = []
     for rec in records:
         fields = rec.get("fields", {}) or {}
-        urls = []
-        for a in fields.get("Photo", []) or []:
-            if isinstance(a, dict) and a.get("url"):
-                urls.append(a["url"])
-            elif isinstance(a, str):
-                urls.append(a)
-        fields["Photo"] = urls
+        _normalize_photo_fields(fields)  # <-- guarantees only URL strings in photo fields
         rows.append(fields)
-
     return rows
 
-# -----------------------------
-# Azure SQL adapter
-# -----------------------------
+def fetch_airtable_all():
+    """Generic fetch (also normalized) in case you ask non-photo questions."""
+    if not _airtable:
+        return []
+    try:
+        records = _airtable.all()
+        rows = []
+        for rec in records:
+            fields = rec.get("fields", {}) or {}
+            _normalize_photo_fields(fields)
+            rows.append(fields)
+        return rows
+    except Exception:
+        return []
+
+# =============================
+# Azure SQL Adapter
+# =============================
 def run_sql(sql: str):
     conn = None
     try:
@@ -111,9 +167,9 @@ def run_sql(sql: str):
         except Exception:
             pass
 
-# -----------------------------
-# Config status
-# -----------------------------
+# =============================
+# Config Status (used by UI test)
+# =============================
 def config_status():
     return {
         "airtable_configured": bool(_airtable),
@@ -121,9 +177,9 @@ def config_status():
         "openai_configured": bool(OPENAI_API_KEY),
     }
 
-# -----------------------------
-# SQL safety
-# -----------------------------
+# =============================
+# SQL Safety (read-only)
+# =============================
 _SQL_BLOCKLIST = re.compile(
     r"(;|--|/\*|\*/|\\x| drop | alter | delete | insert | update | merge | exec | execute | xp_| sp_)",
     flags=re.IGNORECASE,
@@ -138,9 +194,9 @@ def is_safe_select(sql: str) -> bool:
         return False
     return True
 
-# -----------------------------
-# LLM helpers
-# -----------------------------
+# =============================
+# LLM Helpers
+# =============================
 def llm_generate_sql(question: str, schema_hint: str = "") -> str:
     if not OPENAI_API_KEY:
         return "SELECT TOP 10 * FROM INFORMATION_SCHEMA.TABLES"
@@ -188,9 +244,9 @@ def llm_format_answer(question: str, sample_rows: list) -> str:
     )
     return resp.choices[0].message.content.strip()
 
-# -----------------------------
-# HTTP handler
-# -----------------------------
+# =============================
+# HTTP Handler
+# =============================
 class handler(BaseHTTPRequestHandler):
     def _send(self, status: int, payload: dict):
         body = json.dumps(payload).encode()
@@ -238,7 +294,7 @@ class handler(BaseHTTPRequestHandler):
                     "answer": answer,
                     "query_type": "airtable",
                     "sql": None,
-                    "raw_results": rows,
+                    "raw_results": rows,   # already normalized to URL strings
                     "results_count": len(rows),
                 })
 
