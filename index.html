@@ -70,6 +70,7 @@
           <li onclick="setQuestion(this)">Show me all photos from Vermont</li>
           <li onclick="setQuestion(this)">Are there any events that occurred more than once?</li>
           <li onclick="setQuestion(this)">Show me a bar chart of photo counts by state</li>
+          <li onclick="setQuestion(this)">Show me a table of photo counts by state</li>  <!-- NEW -->
           <li onclick="setQuestion(this)">Show me a bar chart of photo counts by employee last name</li>
           <li onclick="setQuestion(this)">Which employee has the most photos?</li>
         </ul>
@@ -162,6 +163,15 @@
       return html;
     }
 
+    function renderCountsByStateTable(items) {
+      let html = '<table><thead><tr><th>State</th><th>Photos</th></tr></thead><tbody>';
+      items.forEach(it => {
+        html += `<tr><td>${escapeHtml(it.state || '')}</td><td>${it.count ?? ''}</td></tr>`;
+      });
+      html += '</tbody></table>';
+      return html;
+    }
+
     function renderChart(chartData) {
       const el = document.getElementById('barChart');
       if (!el) return;
@@ -187,6 +197,9 @@
       }
       if (payload && payload.aggregations && payload.aggregations.type === 'event_repeats') {
         html += renderEventRepeatsTable(payload.aggregations.items || []);
+      }
+      if (payload && payload.aggregations && payload.aggregations.type === 'counts_by_state') {
+        html += renderCountsByStateTable(payload.aggregations.items || []);
       }
       if (Array.isArray(payload.raw_results) && payload.raw_results.length) {
         html += `<div id="photoGrid" class="photo-grid"></div>`;
