@@ -8,7 +8,6 @@ from urllib.parse import quote as urlquote
 
 import requests
 from requests.exceptions import HTTPError
-from pyairtable import Table
 
 # OpenAI is optional
 try:
@@ -16,7 +15,7 @@ try:
 except Exception:
     openai = None
 
-API_VERSION = "2025-08-29-airtable-paging-v12.5"
+API_VERSION = "2025-08-29-no-pyairtable-v1"
 
 # -----------------------------
 # Environment
@@ -42,27 +41,16 @@ AIRTABLE_PAGE_SIZE_DEFAULT = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50")) 
 if openai and OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 
-# -----------------------------
-# Airtable adapter
-# -----------------------------
-_airtable = None
-if AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME:
-    try:
-        _airtable = Table(AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME)
-    except Exception:
-        _airtable = None
-
 STATE_CODES = {"MA", "ME", "RI", "VT"}
 STATE_NAME_TO_CODE = {
-    "massachusetts": "MA",
-    "maine": "ME",
-    "rhode island": "RI",
-    "vermont": "VT",
+    "massachusetts": "MA", "maine": "ME", "rhode island": "RI", "vermont": "VT",
     "ma": "MA", "me": "ME", "ri": "RI", "vt": "VT",
 }
 
-def _safe_to_str(val):
-    return val if isinstance(val, str) else ""
+# -----------------------------
+# Helpers: strings & photos
+# -----------------------------
+def _safe_to_str(val): return val if isinstance(val, str) else ""
 
 def _to_url_list(value):
     urls = []
@@ -83,7 +71,7 @@ def _to_url_list(value):
     return urls
 
 def _normalize_photo_fields(fields: dict):
-    """Normalize attachments to list[str] under fields['Photo'] and set fields['first_photo_url']"""
+    """Normalize attachments to list[str] in fields['Photo'] and set fields['first_photo_url']."""
     candidates = ["Photo", "Photos", "Attachment", "Attachments", "Images", "Image"]
     found = []
     for key in candidates:
@@ -96,36 +84,17 @@ def _normalize_photo_fields(fields: dict):
         fields["Photo"] = found
     fields["first_photo_url"] = found[0] if found else None
 
-def _discover_columns():
-    try:
-        recs = _airtable.all(max_records=1) if _airtable else []
-        if recs:
-            return set((recs[0].get("fields") or {}).keys())
-    except Exception:
-        pass
-    return set()
-
-def _build_formula_for_state(state: str | None):
-    if not state or state not in STATE_CODES:
-        return None
-    existing = _discover_columns()
-    candidates = ["State", "state", "State Abbrev", "State Code"]
-    usable = [f for f in candidates if f in existing]
-    if not usable:
-        return None
-    clauses = [f'UPPER({{{name}}})="{state}"' for name in usable]
-    return "OR(" + ",".join(clauses) + ")"
-
+# -----------------------------
+# Airtable REST (no pyairtable)
+# -----------------------------
 def _airtable_sort_params(sort_list):
     """Convert ['-Date of Event','Name'] into Airtable query params."""
     params = {}
     idx = 0
     for s in (sort_list or []):
-        direction = "asc"
-        field = s
+        direction, field = ("asc", s)
         if isinstance(s, str) and s.startswith("-"):
-            direction = "desc"
-            field = s[1:]
+            direction, field = ("desc", s[1:])
         params[f"sort[{idx}][field]"] = field
         params[f"sort[{idx}][direction]"] = direction
         idx += 1
@@ -150,6 +119,27 @@ def _airtable_list_records(formula=None, sort=None, page_size=50, offset=None):
     data = resp.json()
     return data.get("records", []), data.get("offset")
 
+def _discover_columns():
+    """Try to get field names without pyairtable."""
+    try:
+        recs, _ = _airtable_list_records(page_size=1)
+        if recs:
+            return set((recs[0].get("fields") or {}).keys())
+    except Exception:
+        pass
+    return set()
+
+def _build_formula_for_state(state: str | None):
+    if not state or state not in STATE_CODES:
+        return None
+    existing = _discover_columns()
+    candidates = ["State", "state", "State Abbrev", "State Code"]
+    usable = [f for f in candidates if f in existing]
+    if not usable:
+        return None
+    clauses = [f'UPPER({{{name}}})="{state}"' for name in usable]
+    return "OR(" + ",".join(clauses) + ")"
+
 def get_airtable_photos_page(state=None, page_size=50, cursor=None):
     formula = _build_formula_for_state(state)
     sort = ["-Date of Event"]
@@ -169,12 +159,10 @@ def get_airtable_photos_page(state=None, page_size=50, cursor=None):
     return rows, next_cursor
 
 def fetch_airtable_records_for_aggregation(state=None, max_scan=AIRTABLE_SCAN_LIMIT):
-    """Page through up to max_scan records for aggregate questions."""
-    collected = []
-    cursor = None
+    collected, cursor = [], None
     while len(collected) < max_scan:
         remaining = max_scan - len(collected)
-        page_size = min(100, remaining)  # Airtable max = 100
+        page_size = min(100, remaining)
         page, cursor = get_airtable_photos_page(state=state, page_size=page_size, cursor=cursor)
         if not page:
             break
@@ -270,7 +258,7 @@ def aggregate_repeated_events(state=None, min_count=2, top_n=25):
     return items[:top_n], len(rows)
 
 # -----------------------------
-# SQL helpers (lazy import)
+# SQL helpers (lazy import at call-time)
 # -----------------------------
 _SQL_BLOCKLIST = re.compile(r"(;|--|/\*|\*/|\\x| drop | alter | delete | insert | update | merge | exec | execute | xp_| sp_)", flags=re.IGNORECASE)
 
@@ -371,7 +359,6 @@ def is_bar_chart_by_employee_last_intent(q: str) -> bool:
     return ("bar chart" in ql) and (("employee last name" in ql) or ("by employee" in ql))
 
 def is_table_counts_by_state_intent(q: str) -> bool:
-    """Detect 'table of photo counts by state'."""
     ql = q.lower()
     return ("table" in ql) and ("count" in ql) and ("state" in ql)
 
@@ -381,7 +368,7 @@ def is_table_counts_by_state_intent(q: str) -> bool:
 def config_status():
     return {
         "api_version": API_VERSION,
-        "airtable_configured": bool(_airtable),
+        "airtable_configured": bool(AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME),
         "sql_configured": bool(AZURE_SQL_SERVER and AZURE_SQL_DB and AZURE_SQL_USER and AZURE_SQL_PASSWORD),
         "openai_configured": bool(OPENAI_API_KEY),
         "disable_airtable_summary": DISABLE_AIRTABLE_SUMMARY,
@@ -428,7 +415,7 @@ class handler(BaseHTTPRequestHandler):
             if data.get("debug") == "airtable":
                 sample = []
                 try:
-                    recs, _ = _airtable_list_records(page_size=1) if _airtable else ([], None)
+                    recs, _ = _airtable_list_records(page_size=1)
                     for r in recs:
                         before = (r.get("fields") or {}).copy()
                         after = (r.get("fields") or {}).copy()
@@ -547,7 +534,7 @@ class handler(BaseHTTPRequestHandler):
             return self._send(500, {"error": str(e), "trace": tb})
 
 # -----------------------------
-# Helpers
+# Parse state & limit
 # -----------------------------
 def parse_state_and_limit(question: str):
     m = re.search(r"\b(?:from|in)\s+(massachusetts|maine|rhode island|vermont|ma|me|ri|vt)\b", question, flags=re.IGNORECASE)
