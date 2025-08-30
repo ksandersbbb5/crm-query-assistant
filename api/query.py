@@ -7,7 +7,7 @@ import openai
 from pyairtable import Table
 import pymssql
 
-API_VERSION = "2025-08-29-photos-normalized-v3"
+API_VERSION = "2025-08-29-photos-normalized-v4"
 
 # =============================
 # Environment Variables
@@ -37,35 +37,43 @@ if AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME:
 
 STATE_CODES = {"MA", "ME", "RI", "VT"}
 
+def _safe_to_str(val):
+    """Return val as string if possible; else empty string."""
+    try:
+        return val if isinstance(val, str) else ""
+    except Exception:
+        return ""
+
 def _to_url_list(value):
     """
     Coerce Airtable attachment fields into a list of URL strings only.
-    Accepts:
-      - list of dicts with {'url': ...}
-      - list of strings
-      - single dict or single string
-    Returns: list[str]
+    Accepts list/dict/string/None. Never calls .startswith on non-strings.
     """
     urls = []
-    if not value:
+    if value is None:
         return urls
+
     items = value if isinstance(value, list) else [value]
     for x in items:
-        if isinstance(x, str):
-            # only consider http(s) strings
-            if x.startswith("http"):
-                urls.append(x)
-        elif isinstance(x, dict):
-            u = x.get("url")
-            if isinstance(u, str) and u.startswith("http"):
-                urls.append(u)
-        # ignore everything else silently
+        u = None
+        if isinstance(x, dict):
+            # typical Airtable attachment shape: {"url": "...", ...}
+            maybe = x.get("url")
+            if isinstance(maybe, str):
+                u = maybe
+        elif isinstance(x, str):
+            u = x
+        # else: ignore other types silently
+
+        u = _safe_to_str(u)
+        if u and (u[:4].lower() == "http"):  # avoid attribute calls on non-strings
+            urls.append(u)
     return urls
 
 def _normalize_photo_fields(fields: dict):
     """
     Mutates `fields` so that any common photo/attachment field contains only URL strings.
-    Also sets `first_photo_url` for convenience and ensures `Photo` exists as list[str].
+    Also sets `first_photo_url` and ensures a canonical `Photo` list[str] exists.
     """
     candidates = ["Photo", "Photos", "Attachment", "Attachments", "Images", "Image"]
     found_urls = []
@@ -77,21 +85,18 @@ def _normalize_photo_fields(fields: dict):
             if not found_urls and urls:
                 found_urls = urls
 
-    # Ensure a canonical Photo field exists
+    # Ensure canonical Photo field exists
     if "Photo" not in fields:
         fields["Photo"] = found_urls
 
-    # Convenience single URL
     fields["first_photo_url"] = found_urls[0] if found_urls else None
 
 def parse_state_and_limit(question: str):
     ql = question.lower()
-    # detect state
     state = None
     m = re.search(r"\b(ma|me|ri|vt)\b", ql)
     if m:
         state = m.group(1).upper()
-    # detect limit
     limit = 10
     m2 = re.search(r"\b(past|last)\s+(\d+)", ql)
     if m2:
@@ -109,17 +114,14 @@ def get_airtable_photos(state=None, limit=10):
     # Build Airtable formula using DOUBLE quotes for string literals
     formula = None
     if state and state in STATE_CODES:
-        # Try several field name variants; the first matching column will work
         name_variants = ["State", "state", "State Abbrev", "State Code"]
         clauses = [f'UPPER({{{f}}})="{state}"' for f in name_variants]
         formula = "OR(" + ",".join(clauses) + ")"
 
-    # Sort newest by a likely date field (change if your field name differs)
     sorts = [{"field": "Date of Event", "direction": "desc"}]
 
-    # NOTE: correct kwarg name is `formula=`, not filterByFormula
     records = _airtable.all(
-        formula=formula,
+        formula=formula,   # correct kwarg for pyairtable 2.2.x
         sort=sorts,
         max_records=limit
     )
@@ -127,12 +129,11 @@ def get_airtable_photos(state=None, limit=10):
     rows = []
     for rec in records:
         fields = rec.get("fields", {}) or {}
-        _normalize_photo_fields(fields)  # <-- guarantees only string URLs in photo fields
+        _normalize_photo_fields(fields)
         rows.append(fields)
     return rows
 
 def fetch_airtable_all():
-    """Generic fetch (also normalized) for non-photo questions."""
     if not _airtable:
         return []
     try:
@@ -172,7 +173,7 @@ def run_sql(sql: str):
             pass
 
 # =============================
-# Config Status (and version)
+# Config Status
 # =============================
 def config_status():
     return {
@@ -270,7 +271,6 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        # Health check + version
         return self._send(200, {"status":"ok","config":config_status()})
 
     def do_POST(self):
@@ -281,7 +281,6 @@ class handler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400, {"error":"Invalid JSON"})
 
-        # System test / diagnostics
         if data.get("test"):
             payload = {"ok": True, **config_status()}
             if data.get("debug") == "airtable":
@@ -289,11 +288,10 @@ class handler(BaseHTTPRequestHandler):
                 try:
                     recs = _airtable.all(max_records=1) if _airtable else []
                     for r in recs:
-                        f = r.get("fields", {}) or {}
-                        # show what normalization would do
-                        before = json.loads(json.dumps(f))  # shallow clone for readability
-                        _normalize_photo_fields(f)
-                        sample.append({"before": before, "after": f})
+                        before = (r.get("fields", {}) or {}).copy()
+                        after = (r.get("fields", {}) or {}).copy()
+                        _normalize_photo_fields(after)
+                        sample.append({"before": before, "after": after})
                 except Exception as e:
                     sample = [{"error": str(e)}]
                 payload["airtable_sample"] = sample
@@ -315,7 +313,7 @@ class handler(BaseHTTPRequestHandler):
                     "answer": answer,
                     "query_type": "airtable",
                     "sql": None,
-                    "raw_results": rows,   # already normalized to URL strings
+                    "raw_results": rows,   # normalized to string URLs only
                     "results_count": len(rows),
                 })
 
