@@ -1,13 +1,14 @@
 import os
 import json
 import re
+import traceback
 from http.server import BaseHTTPRequestHandler
 
 import openai
 from pyairtable import Table
 import pymssql
 
-API_VERSION = "2025-08-29-photos-normalized-v5"
+API_VERSION = "2025-08-29-photos-normalized-v6"
 
 # =============================
 # Environment Variables
@@ -23,7 +24,6 @@ AZURE_SQL_DB       = os.getenv("AZURE_SQL_DB")
 AZURE_SQL_USER     = os.getenv("AZURE_SQL_USER")
 AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
 
-# Optional toggle: set to "true" in Vercel to re-enable LLM summary for Airtable later
 DISABLE_AIRTABLE_SUMMARY = (os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true")
 
 openai.api_key = OPENAI_API_KEY
@@ -47,7 +47,7 @@ def _safe_to_str(val):
         return ""
 
 def _to_url_list(value):
-    """Coerce attachments to list[str] without ever calling .startswith on non-strings."""
+    """Coerce attachments to list[str] WITHOUT using .startswith on unknown types."""
     urls = []
     if value is None:
         return urls
@@ -61,13 +61,12 @@ def _to_url_list(value):
         elif isinstance(x, str):
             u = x
         u = _safe_to_str(u)
-        # avoid .startswith; slice+lower is safe for any string
-        if u and (u[:4].lower() == "http"):
+        if u and (u[:4].lower() == "http"):  # safe check
             urls.append(u)
     return urls
 
 def _normalize_photo_fields(fields: dict):
-    """Mutate fields so photo/attachment fields are URL strings only + add first_photo_url."""
+    """Ensure photo fields are URL strings only; add first_photo_url."""
     candidates = ["Photo", "Photos", "Attachment", "Attachments", "Images", "Image"]
     found_urls = []
     for key in candidates:
@@ -99,13 +98,21 @@ def get_airtable_photos(state=None, limit=10):
     """Fetch Airtable rows, normalized to URL strings."""
     if not _airtable:
         return []
+
     formula = None
     if state and state in STATE_CODES:
         name_variants = ["State", "state", "State Abbrev", "State Code"]
         clauses = [f'UPPER({{{f}}})="{state}"' for f in name_variants]
         formula = "OR(" + ",".join(clauses) + ")"
+
     sorts = [{"field": "Date of Event", "direction": "desc"}]
-    records = _airtable.all(formula=formula, sort=sorts, max_records=limit)
+
+    records = _airtable.all(
+        formula=formula,      # correct kwarg for pyairtable 2.2.x
+        sort=sorts,
+        max_records=limit
+    )
+
     rows = []
     for rec in records:
         fields = rec.get("fields", {}) or {}
@@ -284,9 +291,20 @@ class handler(BaseHTTPRequestHandler):
         try:
             if use_airtable:
                 state, limit = parse_state_and_limit(question)
-                rows = get_airtable_photos(state=state, limit=limit)
+                try:
+                    rows = get_airtable_photos(state=state, limit=limit)
+                except Exception as inner_e:
+                    # Return context + traceback so we can pinpoint the exact line
+                    tb = traceback.format_exc()
+                    return self._send(500, {
+                        "error": str(inner_e),
+                        "trace": tb,
+                        "context": {
+                            "state": state,
+                            "limit": limit
+                        }
+                    })
 
-                # Skip LLM summary for Airtable to avoid stray .startswith issues
                 if DISABLE_AIRTABLE_SUMMARY:
                     human_state = state or "any state"
                     answer = f"Found {len(rows)} photos from {human_state}."
@@ -297,7 +315,7 @@ class handler(BaseHTTPRequestHandler):
                     "answer": answer,
                     "query_type": "airtable",
                     "sql": None,
-                    "raw_results": rows,   # normalized list[str] in Photo + first_photo_url
+                    "raw_results": rows[:10],   # normalized list[str] in Photo + first_photo_url
                     "results_count": len(rows),
                 })
 
@@ -318,4 +336,5 @@ class handler(BaseHTTPRequestHandler):
             })
 
         except Exception as e:
-            return self._send(500, {"error": str(e)})
+            tb = traceback.format_exc()
+            return self._send(500, {"error": str(e), "trace": tb})
