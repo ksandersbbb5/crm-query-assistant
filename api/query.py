@@ -16,7 +16,7 @@ try:
 except Exception:
     openai = None
 
-API_VERSION = "2025-08-29-airtable-paging-v12.4"
+API_VERSION = "2025-08-29-airtable-paging-v12.5"
 
 # -----------------------------
 # Environment
@@ -356,7 +356,7 @@ def llm_format_answer(question: str, sample_rows: list) -> str:
 # -----------------------------
 def is_employee_most_photos_intent(q: str) -> bool:
     ql = q.lower()
-    return ("employee" in ql) and (("most photos" in ql) or ("most pictures" in ql) or ("who has the most" in ql))
+    return ("employee" in ql) and (("most photos" in ql) or ("most pictures" in ql) or ("who has the most" in ql)))
 
 def is_event_repeats_intent(q: str) -> bool:
     ql = q.lower()
@@ -371,7 +371,7 @@ def is_bar_chart_by_employee_last_intent(q: str) -> bool:
     return ("bar chart" in ql) and (("employee last name" in ql) or ("by employee" in ql))
 
 def is_table_counts_by_state_intent(q: str) -> bool:
-    """New: detect 'table of photo counts by state'"""
+    """Detect 'table of photo counts by state'."""
     ql = q.lower()
     return ("table" in ql) and ("count" in ql) and ("state" in ql)
 
@@ -407,7 +407,7 @@ class handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-               self.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
         self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
         self.end_headers()
 
@@ -494,7 +494,6 @@ class handler(BaseHTTPRequestHandler):
                         "raw_results": [], "results_count": total, "next_cursor": None
                     })
 
-                # NEW: table of counts by state
                 if is_table_counts_by_state_intent(question):
                     labels, data_pts, total = aggregate_counts_by_state(state=state)
                     table_rows = [{"state": s, "count": c} for s, c in zip(labels, data_pts)]
