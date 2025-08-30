@@ -9,15 +9,14 @@ from urllib.parse import quote as urlquote
 import requests
 from requests.exceptions import HTTPError
 from pyairtable import Table
-import pymssql
 
-# OpenAI is optional for SQL formatting; app runs without it.
+# OpenAI is optional
 try:
     import openai  # type: ignore
 except Exception:
     openai = None
 
-API_VERSION = "2025-08-29-airtable-paging-v12.2"
+API_VERSION = "2025-08-29-airtable-paging-v12.3"
 
 # -----------------------------
 # Environment
@@ -37,8 +36,8 @@ AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
 DISABLE_AIRTABLE_SUMMARY = os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true"
 AIRTABLE_DEFAULT_LIMIT = int(os.getenv("AIRTABLE_DEFAULT_LIMIT", "50"))
 AIRTABLE_MAX_LIMIT = int(os.getenv("AIRTABLE_MAX_LIMIT", "5000"))
-AIRTABLE_SCAN_LIMIT = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))   # rows scanned for aggregations
-AIRTABLE_PAGE_SIZE_DEFAULT = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50"))  # per-page (1..100)
+AIRTABLE_SCAN_LIMIT = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))
+AIRTABLE_PAGE_SIZE_DEFAULT = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50"))
 
 if openai and OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
@@ -87,7 +86,7 @@ def _to_url_list(value):
     return urls
 
 def _normalize_photo_fields(fields: dict):
-    """Ensure fields['Photo'] is a list[str] of urls and add fields['first_photo_url']"""
+    """Normalize attachments to list[str] under fields['Photo'] and set fields['first_photo_url']"""
     candidates = ["Photo", "Photos", "Attachment", "Attachments", "Images", "Image"]
     found = []
     for key in candidates:
@@ -160,7 +159,7 @@ def get_airtable_photos_page(state=None, page_size=50, cursor=None):
     try:
         recs, next_cursor = _airtable_list_records(formula=formula, sort=sort, page_size=page_size, offset=cursor)
     except HTTPError as http_err:
-        # Fallback to no filter if the formula references a column that doesn't exist
+        # If formula references a non-existent column, fall back to no filter
         if getattr(http_err, "response", None) and http_err.response.status_code == 422:
             recs, next_cursor = _airtable_list_records(formula=None, sort=sort, page_size=page_size, offset=cursor)
         else:
@@ -276,10 +275,15 @@ def aggregate_repeated_events(state=None, min_count=2, top_n=25):
 # -----------------------------
 # SQL helpers
 # -----------------------------
-_SQL_BLOCKLIST = re.compile(r"(;|--|/\*|\*/|\\x| drop | alter | delete | insert | update | merge | exec | execute | xp_| sp_)",
-                            flags=re.IGNORECASE)
+_SQL_BLOCKLIST = re.compile(r"(;|--|/\*|\*/|\\x| drop | alter | delete | insert | update | merge | exec | execute | xp_| sp_)", flags=re.IGNORECASE)
 
 def run_sql(sql: str):
+    # Lazy import pymssql so the function doesn't crash if driver isn't present
+    try:
+        import pymssql  # type: ignore
+    except Exception as ie:
+        raise RuntimeError(f"SQL driver import failed: {ie}. If deploying on Vercel, ensure pymssql/FreeTDS are available or use a proxy.") from ie
+
     conn = None
     try:
         conn = pymssql.connect(
@@ -356,7 +360,7 @@ def llm_format_answer(question: str, sample_rows: list) -> str:
 # -----------------------------
 def is_employee_most_photos_intent(q: str) -> bool:
     ql = q.lower()
-    return ("employee" in ql) and (("most photos" in ql) or ("most pictures" in ql) or ("who has the most" in ql)))
+    return ("employee" in ql) and (("most photos" in ql) or ("most pictures" in ql) or ("who has the most" in ql))
 
 def is_event_repeats_intent(q: str) -> bool:
     ql = q.lower()
@@ -364,11 +368,11 @@ def is_event_repeats_intent(q: str) -> bool:
 
 def is_bar_chart_by_state_intent(q: str) -> bool:
     ql = q.lower()
-    return ("bar chart" in ql) and (("by state" in ql) or ("state" in ql)))
+    return ("bar chart" in ql) and (("by state" in ql) or ("state" in ql))
 
 def is_bar_chart_by_employee_last_intent(q: str) -> bool:
     ql = q.lower()
-    return ("bar chart" in ql) and (("employee last name" in ql) or ("by employee" in ql)))
+    return ("bar chart" in ql) and (("employee last name" in ql) or ("by employee" in ql))
 
 # -----------------------------
 # Status
@@ -515,7 +519,12 @@ class handler(BaseHTTPRequestHandler):
             if not is_safe_select(candidate_sql):
                 return self._send(400, {"error": "Generated SQL failed safety checks", "sql": candidate_sql})
 
-            rows = run_sql(candidate_sql)
+            try:
+                rows = run_sql(candidate_sql)
+            except Exception as db_e:
+                tb = traceback.format_exc()
+                return self._send(500, {"error": str(db_e), "trace": tb, "sql": candidate_sql})
+
             answer = llm_format_answer(question, rows)
             return self._send(200, {
                 "answer": answer, "query_type": "sql", "sql": candidate_sql,
@@ -527,10 +536,9 @@ class handler(BaseHTTPRequestHandler):
             return self._send(500, {"error": str(e), "trace": tb})
 
 # -----------------------------
-# Small helpers used above
+# Helpers
 # -----------------------------
 def parse_state_and_limit(question: str):
-    """Extract optional state + result limit from user question."""
     m = re.search(r"\b(?:from|in)\s+(massachusetts|maine|rhode island|vermont|ma|me|ri|vt)\b", question, flags=re.IGNORECASE)
     state = None
     if m:
