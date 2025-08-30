@@ -93,7 +93,7 @@
         // Plugin: draw values above bars
         const valueLabelPlugin = {
           id: 'valueLabelPlugin',
-          afterDatasetsDraw(chart, args, pluginOptions) {
+          afterDatasetsDraw(chart) {
             const {ctx} = chart;
             ctx.save();
             const ds = chart.data.datasets[0];
@@ -223,6 +223,16 @@
             if (Array.isArray(payload.raw_results) && payload.raw_results.length) renderPhotoGrid();
         }
 
+        async function safeParseResponse(response) {
+            const contentType = response.headers.get('content-type') || '';
+            const text = await response.text();
+            try {
+                return { data: JSON.parse(text), raw: text };
+            } catch (e) {
+                return { data: null, raw: text, contentType };
+            }
+        }
+
         async function askQuestion() {
             const q = document.getElementById('question').value.trim();
             if (!q) return alert('Please enter a question');
@@ -238,15 +248,18 @@
 
             try {
                 const response = await fetch('/api/query', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q }) });
-                const data = await response.json();
-
+                const parsed = await safeParseResponse(response);
+                if (!parsed.data) {
+                    resultDiv.innerHTML = `<div class="error"><strong>Server returned non‑JSON:</strong> ${escapeHtml(parsed.raw.slice(0, 400))}</div>`;
+                    return;
+                }
+                const data = parsed.data;
                 if (data.error) {
                     const traceBlock = data.trace ? `<details><summary>Show technical details</summary><code>${escapeHtml(data.trace)}</code></details>` : '';
                     const ctx = data.context ? `<br/><small>Context: <code>${escapeHtml(JSON.stringify(data.context))}</code></small>` : '';
                     resultDiv.innerHTML = `<div class="error"><strong>Error:</strong> ${escapeHtml(data.error)}${ctx}${traceBlock}</div>`;
                     return;
                 }
-
                 nextCursor = data.next_cursor || null;
                 lastRawResults = (data.raw_results || []);
                 renderResults(data.answer, data);
@@ -262,14 +275,21 @@
             const loadBtn = document.getElementById('loadMoreBtn');
             if (loadBtn) { loadBtn.disabled = true; loadBtn.textContent = 'Loading...'; }
             try {
-                const payload = { question: lastQuestion, cursor: nextCursor };
-                const response = await fetch('/api/query', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-                const data = await response.json();
+                const response = await fetch('/api/query', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: lastQuestion, cursor: nextCursor }) });
+                const parsed = await safeParseResponse(response);
+                if (!parsed.data) {
+                    const resultDiv = document.getElementById('result');
+                    resultDiv.insertAdjacentHTML('beforeend', `<div class="error"><strong>Server returned non‑JSON:</strong> ${escapeHtml(parsed.raw.slice(0, 400))}</div>`);
+                    if (loadBtn) { loadBtn.disabled = false; loadBtn.textContent = 'Load more'; }
+                    return;
+                }
+                const data = parsed.data;
                 if (data.error) {
                     const resultDiv = document.getElementById('result');
                     const traceBlock = data.trace ? `<details><summary>Show technical details</summary><code>${escapeHtml(data.trace)}</code></details>` : '';
                     const ctx = data.context ? `<br/><small>Context: <code>${escapeHtml(JSON.stringify(data.context))}</code></small>` : '';
                     resultDiv.insertAdjacentHTML('beforeend', `<div class="error"><strong>Error:</strong> ${escapeHtml(data.error)}${ctx}${traceBlock}</div>`);
+                    if (loadBtn) { loadBtn.disabled = false; loadBtn.textContent = 'Load more'; }
                     return;
                 }
                 nextCursor = data.next_cursor || null;
@@ -286,14 +306,338 @@
         }
 
         async function runTest() {
-            const res = await fetch('/api/query', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ test: true }) });
-            const data = await res.json();
+            const response = await fetch('/api/query', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ test: true }) });
+            const parsed = await safeParseResponse(response);
+            const data = parsed.data || { error: 'non-JSON', raw: parsed.raw };
             document.getElementById('result').innerHTML = `<div class="result-container"><h3>System Configuration</h3><code>${escapeHtml(JSON.stringify(data, null, 2))}</code></div>`;
         }
 
         async function debugAirtable() {
-            const res = await fetch('/api/query', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ test: true, debug: 'airtable' }) });
-            const data = await res.json();
+            const response = await fetch('/api/query', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ test: true, debug: 'airtable' }) });
+            const parsed = await safeParseResponse(response);
+            const data = parsed.data || { error: 'non-JSON', raw: parsed.raw };
+            document.getElementById('result').innerHTML = `<div class="result-container"><h3>Airtable Debug</h3><code>${escapeHtml(JSON.stringify(data, null, 2))}</code></div>`;
+        }
+    </script>
+</body>
+</html><!DOCTYPE html>
+<html>
+<head>
+    <title>CRM Query Assistant</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; line-height: 1.6; }
+        .header { text-align: center; margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid #eee; }
+        .query-container { background: white; padding: 16px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); margin-bottom: 10px; }
+        .query-box { width: 100%; padding: 12px; border: 2px solid #e1e5e9; border-radius: 6px; font-size: 16px; font-family: inherit; resize: vertical; }
+        .ask-button, .test-button { background: #0066cc; color: white; padding: 10px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 15px; font-weight: 600; margin-top: 10px; }
+        .test-button { background: #666; margin-left: 10px; }
+        .result-container { background: #f8f9fa; padding: 16px; border-radius: 6px; margin: 16px 0; border-left: 4px solid #0066cc; }
+        .error { color: #d73502; background: #fff5f5; padding: 15px; border-radius: 6px; border-left: 4px solid #d73502; white-space: pre-wrap; }
+        .photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px; margin: 16px 0; }
+        .photo-item { background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+        .photo-item img { width: 100%; height: 150px; object-fit: cover; }
+        .photo-info { padding: 10px; font-size: 14px; }
+        .load-more { display: block; margin: 10px auto; padding: 10px 16px; border-radius: 6px; border: 1px solid #ccc; background: white; cursor: pointer; }
+        .source-badge { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; margin-left: 10px; }
+        .source-badge.sql { background: #e3f2fd; color: #1976d2; }
+        .source-badge.airtable { background: #f3e5f5; color: #7b1fa2; }
+        details summary { cursor: pointer; font-weight: 600; }
+        details.examples { margin: 8px 0 16px; background: #f8f9fb; border: 1px solid #e7ebf0; border-radius: 8px; padding: 10px 12px; }
+        .examples-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .examples-grid h4 { margin: 8px 0 4px; }
+        .examples-grid ul { margin: 0; padding-left: 18px; }
+        .examples-grid li { margin: 6px 0; cursor: pointer; color: #0066cc; }
+        .examples-grid li:hover { text-decoration: underline; }
+        code { font-family: 'Monaco', 'Menlo', monospace; font-size: 12px; }
+        table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
+        th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; }
+        th { background: #f1f5f9; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>CRM Query Assistant</h1>
+        <p>Ask questions about your CRM data and CREM photos in natural language</p>
+    </div>
+
+    <div class="query-container">
+        <textarea id="question" class="query-box" rows="3" placeholder="Example: Show me all photos from VT, or Which employee has the most photos?"></textarea>
+        <div>
+          <button id="askButton" class="ask-button" onclick="askQuestion()">Ask Question</button>
+          <button class="test-button" onclick="runTest()">Run System Test</button>
+          <button class="test-button" onclick="debugAirtable()">Debug Airtable</button>
+        </div>
+    </div>
+
+    <!-- Collapsible examples dropdown -->
+    <details class="examples">
+      <summary>Example questions</summary>
+      <div class="examples-grid">
+        <div>
+          <h4>CRM Applications</h4>
+          <ul>
+            <li onclick="setQuestion(this)">What's the status of application ID 45874?</li>
+            <li onclick="setQuestion(this)">Show me all applications from ME with invoice total over $1000</li>
+            <li onclick="setQuestion(this)">List the top 10 cities by number of applications</li>
+            <li onclick="setQuestion(this)">Give me average invoice amount by salesperson</li>
+            <li onclick="setQuestion(this)">How many applications were rejected or denied?</li>
+          </ul>
+        </div>
+        <div>
+          <h4>CREM Photos (Airtable)</h4>
+          <ul>
+            <li onclick="setQuestion(this)">Show me the past 5 photos from VT</li>
+            <li onclick="setQuestion(this)">Show me all photos from Vermont</li>
+            <li onclick="setQuestion(this)">Are there any events that occurred more than once?</li>
+            <li onclick="setQuestion(this)">Show me a bar chart of photo counts by state</li>
+            <li onclick="setQuestion(this)">Show me a bar chart of photo counts by employee last name</li>
+            <li onclick="setQuestion(this)">Which employee has the most photos?</li>
+          </ul>
+        </div>
+      </div>
+      <div style="margin-top:8px">
+        <button class="ask-button" style="background:#0052a3" onclick="askQuestion()">Ask with selected example</button>
+      </div>
+    </details>
+
+    <div id="result"></div>
+
+    <script>
+        let lastQuestion = '';
+        let nextCursor = null;
+        let lastRawResults = [];
+        let currentSource = 'airtable';
+        let currentChart = null;
+
+        // Plugin: draw values above bars
+        const valueLabelPlugin = {
+          id: 'valueLabelPlugin',
+          afterDatasetsDraw(chart) {
+            const {ctx} = chart;
+            ctx.save();
+            const ds = chart.data.datasets[0];
+            if (!ds) { ctx.restore(); return; }
+            const meta = chart.getDatasetMeta(0);
+            meta.data.forEach((bar, i) => {
+              const val = ds.data[i];
+              if (val == null) return;
+              ctx.font = '12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+              ctx.fillStyle = '#333';
+              ctx.textAlign = 'center';
+              ctx.textBaseline = 'bottom';
+              ctx.fillText(val, bar.x, bar.y - 4);
+            });
+            ctx.restore();
+          }
+        };
+        Chart.register(valueLabelPlugin);
+
+        function escapeHtml(str) {
+            return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
+        function setQuestion(el){ document.getElementById('question').value = el.textContent; }
+
+        function renderPhotoGrid() {
+            const grid = document.getElementById('photoGrid');
+            if (!grid) return;
+            let gridHtml = '';
+            for (const item of lastRawResults) {
+                const eventName = item['Event Name'] || 'Unnamed Event';
+                const state = item.State || 'Unknown';
+                const date = item['Date of Event'] || '';
+                const employeeName = `${(item['Employee First Name']||'').toString()} ${(item['Employee Last Name']||'').toString()}`.trim() || 'Unknown';
+
+                let firstUrl = null;
+                let raw = item.Photo || item.first_photo_url || null;
+                if (Array.isArray(raw)) {
+                    if (typeof raw[0] === 'string') firstUrl = raw[0];
+                    else if (raw[0] && typeof raw[0] === 'object' && typeof raw[0].url === 'string') firstUrl = raw[0].url;
+                } else if (typeof raw === 'string') {
+                    firstUrl = raw;
+                } else if (raw && typeof raw === 'object' && typeof raw.url === 'string') {
+                    firstUrl = raw.url;
+                }
+
+                gridHtml += `<div class="photo-item">`;
+                if (firstUrl) gridHtml += `<img src="${firstUrl}" alt="${escapeHtml(eventName)}" onerror="this.style.display='none'">`;
+                gridHtml += `<div class="photo-info">
+                    <div><strong>${escapeHtml(eventName)}</strong></div>
+                    <div>${escapeHtml(state)} • ${date ? new Date(date).toLocaleDateString() : 'No date'}</div>
+                    <div>${escapeHtml(employeeName)}</div>
+                </div></div>`;
+            }
+            grid.innerHTML = gridHtml;
+        }
+
+        function renderEventRepeatsTable(items) {
+            let html = '<table><thead><tr><th>Event</th><th>Count</th><th>Top states</th><th>First date</th><th>Last date</th></tr></thead><tbody>';
+            items.forEach(it => {
+                html += `<tr>
+                    <td>${escapeHtml(it.event_name || '')}</td>
+                    <td>${it.count ?? ''}</td>
+                    <td>${escapeHtml((it.top_states || []).join(', '))}</td>
+                    <td>${it.first_date ? new Date(it.first_date).toLocaleDateString() : ''}</td>
+                    <td>${it.last_date ? new Date(it.last_date).toLocaleDateString() : ''}</td>
+                </tr>`;
+            });
+            html += '</tbody></table>';
+            return html;
+        }
+
+        function renderChart(chartData) {
+            const el = document.getElementById('barChart');
+            if (!el) return;
+            currentChart && currentChart.destroy();
+            currentChart = new Chart(el.getContext('2d'), {
+                type: chartData.type || 'bar',
+                data: {
+                  labels: chartData.labels || [],
+                  datasets: chartData.datasets || []
+                },
+                options: {
+                  responsive: true,
+                  plugins: {
+                    legend: { display: false },
+                    tooltip: { enabled: true }
+                  },
+                  scales: {
+                    y: { beginAtZero: true, ticks: { precision: 0 } }
+                  }
+                }
+            });
+        }
+
+        function renderResults(answer, payload) {
+            const resultDiv = document.getElementById('result');
+            const sourceBadge = currentSource === 'airtable' ? '<span class="source-badge airtable">Airtable</span>' : '<span class="source-badge sql">SQL Server</span>';
+            let html = `<div class="result-container"><h3>Answer: ${sourceBadge}</h3>`;
+            html += `<p>${escapeHtml(answer || '')}</p>`;
+
+            // 1) Chart?
+            if (payload && payload.chart && payload.chart.type === 'bar') {
+                html += `<canvas id="barChart" height="240"></canvas>`;
+            }
+
+            // 2) Event repeats table?
+            if (payload && payload.aggregations && payload.aggregations.type === 'event_repeats') {
+                const items = payload.aggregations.items || [];
+                html += renderEventRepeatsTable(items);
+            }
+
+            // 3) Photo grid?
+            if (Array.isArray(payload.raw_results) && payload.raw_results.length) {
+                html += `<div id="photoGrid" class="photo-grid"></div>`;
+                if (payload.next_cursor) {
+                    html += `<button id="loadMoreBtn" class="load-more" onclick="loadMore()">Load more</button>`;
+                }
+            }
+
+            // 4) Raw payload
+            html += `<details><summary>View Raw Results</summary><code>${escapeHtml(JSON.stringify(payload || {}, null, 2))}</code></details>`;
+            html += `</div>`;
+            resultDiv.innerHTML = html;
+
+            // Post-render hooks
+            if (payload && payload.chart && payload.chart.type === 'bar') renderChart(payload.chart);
+            if (Array.isArray(payload.raw_results) && payload.raw_results.length) renderPhotoGrid();
+        }
+
+        async function safeParseResponse(response) {
+            const contentType = response.headers.get('content-type') || '';
+            const text = await response.text();
+            try {
+                return { data: JSON.parse(text), raw: text };
+            } catch (e) {
+                return { data: null, raw: text, contentType };
+            }
+        }
+
+        async function askQuestion() {
+            const q = document.getElementById('question').value.trim();
+            if (!q) return alert('Please enter a question');
+            lastQuestion = q;
+            nextCursor = null;
+            lastRawResults = [];
+            currentSource = (q.toLowerCase().includes('photo') || q.toLowerCase().includes('airtable') || q.toLowerCase().includes('event')) ? 'airtable' : 'sql';
+
+            const resultDiv = document.getElementById('result');
+            const askButton = document.getElementById('askButton');
+            askButton.disabled = true; askButton.textContent = 'Processing...';
+            resultDiv.innerHTML = `<div>Processing...</div>`;
+
+            try {
+                const response = await fetch('/api/query', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q }) });
+                const parsed = await safeParseResponse(response);
+                if (!parsed.data) {
+                    resultDiv.innerHTML = `<div class="error"><strong>Server returned non‑JSON:</strong> ${escapeHtml(parsed.raw.slice(0, 400))}</div>`;
+                    return;
+                }
+                const data = parsed.data;
+                if (data.error) {
+                    const traceBlock = data.trace ? `<details><summary>Show technical details</summary><code>${escapeHtml(data.trace)}</code></details>` : '';
+                    const ctx = data.context ? `<br/><small>Context: <code>${escapeHtml(JSON.stringify(data.context))}</code></small>` : '';
+                    resultDiv.innerHTML = `<div class="error"><strong>Error:</strong> ${escapeHtml(data.error)}${ctx}${traceBlock}</div>`;
+                    return;
+                }
+                nextCursor = data.next_cursor || null;
+                lastRawResults = (data.raw_results || []);
+                renderResults(data.answer, data);
+            } catch (e) {
+                resultDiv.innerHTML = `<div class="error"><strong>Network Error:</strong> ${escapeHtml(e.message)}</div>`;
+            } finally {
+                askButton.disabled = false; askButton.textContent = 'Ask Question';
+            }
+        }
+
+        async function loadMore() {
+            if (!nextCursor) return;
+            const loadBtn = document.getElementById('loadMoreBtn');
+            if (loadBtn) { loadBtn.disabled = true; loadBtn.textContent = 'Loading...'; }
+            try {
+                const response = await fetch('/api/query', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: lastQuestion, cursor: nextCursor }) });
+                const parsed = await safeParseResponse(response);
+                if (!parsed.data) {
+                    const resultDiv = document.getElementById('result');
+                    resultDiv.insertAdjacentHTML('beforeend', `<div class="error"><strong>Server returned non‑JSON:</strong> ${escapeHtml(parsed.raw.slice(0, 400))}</div>`);
+                    if (loadBtn) { loadBtn.disabled = false; loadBtn.textContent = 'Load more'; }
+                    return;
+                }
+                const data = parsed.data;
+                if (data.error) {
+                    const resultDiv = document.getElementById('result');
+                    const traceBlock = data.trace ? `<details><summary>Show technical details</summary><code>${escapeHtml(data.trace)}</code></details>` : '';
+                    const ctx = data.context ? `<br/><small>Context: <code>${escapeHtml(JSON.stringify(data.context))}</code></small>` : '';
+                    resultDiv.insertAdjacentHTML('beforeend', `<div class="error"><strong>Error:</strong> ${escapeHtml(data.error)}${ctx}${traceBlock}</div>`);
+                    if (loadBtn) { loadBtn.disabled = false; loadBtn.textContent = 'Load more'; }
+                    return;
+                }
+                nextCursor = data.next_cursor || null;
+                const newRows = data.raw_results || [];
+                lastRawResults = lastRawResults.concat(newRows);
+                renderPhotoGrid();
+                if (!nextCursor && loadBtn) loadBtn.remove();
+                if (loadBtn && nextCursor) { loadBtn.disabled = false; loadBtn.textContent = 'Load more'; }
+            } catch (e) {
+                const resultDiv = document.getElementById('result');
+                resultDiv.insertAdjacentHTML('beforeend', `<div class="error"><strong>Network Error:</strong> ${escapeHtml(e.message)}</div>`);
+                if (loadBtn) { loadBtn.disabled = false; loadBtn.textContent = 'Load more'; }
+            }
+        }
+
+        async function runTest() {
+            const response = await fetch('/api/query', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ test: true }) });
+            const parsed = await safeParseResponse(response);
+            const data = parsed.data || { error: 'non-JSON', raw: parsed.raw };
+            document.getElementById('result').innerHTML = `<div class="result-container"><h3>System Configuration</h3><code>${escapeHtml(JSON.stringify(data, null, 2))}</code></div>`;
+        }
+
+        async function debugAirtable() {
+            const response = await fetch('/api/query', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ test: true, debug: 'airtable' }) });
+            const parsed = await safeParseResponse(response);
+            const data = parsed.data || { error: 'non-JSON', raw: parsed.raw };
             document.getElementById('result').innerHTML = `<div class="result-container"><h3>Airtable Debug</h3><code>${escapeHtml(JSON.stringify(data, null, 2))}</code></div>`;
         }
     </script>
