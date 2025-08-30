@@ -8,7 +8,7 @@ import openai
 from pyairtable import Table
 import pymssql
 
-API_VERSION = "2025-08-29-photos-normalized-v6"
+API_VERSION = "2025-08-29-photos-normalized-v7"
 
 # =============================
 # Environment Variables
@@ -24,6 +24,7 @@ AZURE_SQL_DB       = os.getenv("AZURE_SQL_DB")
 AZURE_SQL_USER     = os.getenv("AZURE_SQL_USER")
 AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
 
+# Keep summaries off for Airtable while we harden things
 DISABLE_AIRTABLE_SUMMARY = (os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true")
 
 openai.api_key = OPENAI_API_KEY
@@ -39,6 +40,13 @@ if AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME:
         _airtable = None
 
 STATE_CODES = {"MA", "ME", "RI", "VT"}
+STATE_NAME_TO_CODE = {
+    "massachusetts": "MA",
+    "maine": "ME",
+    "rhode island": "RI",
+    "vermont": "VT",
+    "ma": "MA", "me": "ME", "ri": "RI", "vt": "VT",
+}
 
 def _safe_to_str(val):
     try:
@@ -80,16 +88,29 @@ def _normalize_photo_fields(fields: dict):
     fields["first_photo_url"] = found_urls[0] if found_urls else None
 
 def parse_state_and_limit(question: str):
-    ql = question.lower()
+    """Find state and limit without confusing 'show me' with state ME."""
+    # 1) Prefer 'from|in <state>' patterns
+    m = re.search(
+        r"\b(?:from|in)\s+(massachusetts|maine|rhode island|vermont|ma|me|ri|vt)\b",
+        question,
+        flags=re.IGNORECASE,
+    )
     state = None
-    m = re.search(r"\b(ma|me|ri|vt)\b", ql)
     if m:
-        state = m.group(1).upper()
+        state = STATE_NAME_TO_CODE[m.group(1).lower()]
+
+    # 2) Fallback to bare two-letter codes that are ALL CAPS (avoids 'me' in 'show me')
+    if not state:
+        m2 = re.search(r"\b(MA|ME|RI|VT)\b", question)
+        if m2:
+            state = m2.group(1).upper()
+
+    # Limit
     limit = 10
-    m2 = re.search(r"\b(past|last)\s+(\d+)", ql)
-    if m2:
+    m3 = re.search(r"\b(past|last)\s+(\d+)", question, flags=re.IGNORECASE)
+    if m3:
         try:
-            limit = max(1, min(100, int(m2.group(2))))
+            limit = max(1, min(100, int(m3.group(2))))
         except Exception:
             pass
     return state, limit
@@ -101,15 +122,17 @@ def get_airtable_photos(state=None, limit=10):
 
     formula = None
     if state and state in STATE_CODES:
+        # Try a few field names your base might use
         name_variants = ["State", "state", "State Abbrev", "State Code"]
         clauses = [f'UPPER({{{f}}})="{state}"' for f in name_variants]
         formula = "OR(" + ",".join(clauses) + ")"
 
-    sorts = [{"field": "Date of Event", "direction": "desc"}]
+    # IMPORTANT: pyairtable expects sort as strings, not dicts
+    sort = ["-Date of Event"]  # descending by date; change field name if your base differs
 
     records = _airtable.all(
         formula=formula,      # correct kwarg for pyairtable 2.2.x
-        sort=sorts,
+        sort=sort,            # FIXED: use strings like "-Field Name"
         max_records=limit
     )
 
@@ -285,6 +308,7 @@ class handler(BaseHTTPRequestHandler):
         if not question:
             return self._send(400, {"error":"Missing 'question'"})
 
+        # Decide Airtable vs SQL
         ql = question.lower()
         use_airtable = ("photo" in ql) or ("airtable" in ql)
 
@@ -294,15 +318,11 @@ class handler(BaseHTTPRequestHandler):
                 try:
                     rows = get_airtable_photos(state=state, limit=limit)
                 except Exception as inner_e:
-                    # Return context + traceback so we can pinpoint the exact line
                     tb = traceback.format_exc()
                     return self._send(500, {
                         "error": str(inner_e),
                         "trace": tb,
-                        "context": {
-                            "state": state,
-                            "limit": limit
-                        }
+                        "context": {"state": state, "limit": limit}
                     })
 
                 if DISABLE_AIRTABLE_SUMMARY:
@@ -315,11 +335,11 @@ class handler(BaseHTTPRequestHandler):
                     "answer": answer,
                     "query_type": "airtable",
                     "sql": None,
-                    "raw_results": rows[:10],   # normalized list[str] in Photo + first_photo_url
+                    "raw_results": rows[:10],
                     "results_count": len(rows),
                 })
 
-            # SQL path (unchanged)
+            # SQL path
             schema_hint = "(List allowed tables/views here)"
             candidate_sql = llm_generate_sql(question, schema_hint)
             if not is_safe_select(candidate_sql):
