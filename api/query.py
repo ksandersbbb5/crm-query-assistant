@@ -7,7 +7,7 @@ import openai
 from pyairtable import Table
 import pymssql
 
-API_VERSION = "2025-08-29-photos-normalized-v4"
+API_VERSION = "2025-08-29-photos-normalized-v5"
 
 # =============================
 # Environment Variables
@@ -22,6 +22,9 @@ AZURE_SQL_SERVER   = os.getenv("AZURE_SQL_SERVER")
 AZURE_SQL_DB       = os.getenv("AZURE_SQL_DB")
 AZURE_SQL_USER     = os.getenv("AZURE_SQL_USER")
 AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
+
+# Optional toggle: set to "true" in Vercel to re-enable LLM summary for Airtable later
+DISABLE_AIRTABLE_SUMMARY = (os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true")
 
 openai.api_key = OPENAI_API_KEY
 
@@ -38,57 +41,43 @@ if AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME:
 STATE_CODES = {"MA", "ME", "RI", "VT"}
 
 def _safe_to_str(val):
-    """Return val as string if possible; else empty string."""
     try:
         return val if isinstance(val, str) else ""
     except Exception:
         return ""
 
 def _to_url_list(value):
-    """
-    Coerce Airtable attachment fields into a list of URL strings only.
-    Accepts list/dict/string/None. Never calls .startswith on non-strings.
-    """
+    """Coerce attachments to list[str] without ever calling .startswith on non-strings."""
     urls = []
     if value is None:
         return urls
-
     items = value if isinstance(value, list) else [value]
     for x in items:
         u = None
         if isinstance(x, dict):
-            # typical Airtable attachment shape: {"url": "...", ...}
-            maybe = x.get("url")
-            if isinstance(maybe, str):
-                u = maybe
+            candidate = x.get("url")
+            if isinstance(candidate, str):
+                u = candidate
         elif isinstance(x, str):
             u = x
-        # else: ignore other types silently
-
         u = _safe_to_str(u)
-        if u and (u[:4].lower() == "http"):  # avoid attribute calls on non-strings
+        # avoid .startswith; slice+lower is safe for any string
+        if u and (u[:4].lower() == "http"):
             urls.append(u)
     return urls
 
 def _normalize_photo_fields(fields: dict):
-    """
-    Mutates `fields` so that any common photo/attachment field contains only URL strings.
-    Also sets `first_photo_url` and ensures a canonical `Photo` list[str] exists.
-    """
+    """Mutate fields so photo/attachment fields are URL strings only + add first_photo_url."""
     candidates = ["Photo", "Photos", "Attachment", "Attachments", "Images", "Image"]
     found_urls = []
-
     for key in candidates:
         if key in fields:
             urls = _to_url_list(fields.get(key))
             fields[key] = urls
             if not found_urls and urls:
                 found_urls = urls
-
-    # Ensure canonical Photo field exists
     if "Photo" not in fields:
         fields["Photo"] = found_urls
-
     fields["first_photo_url"] = found_urls[0] if found_urls else None
 
 def parse_state_and_limit(question: str):
@@ -107,25 +96,16 @@ def parse_state_and_limit(question: str):
     return state, limit
 
 def get_airtable_photos(state=None, limit=10):
-    """Fetch Airtable rows, normalizing all photo/attachment fields to URL strings."""
+    """Fetch Airtable rows, normalized to URL strings."""
     if not _airtable:
         return []
-
-    # Build Airtable formula using DOUBLE quotes for string literals
     formula = None
     if state and state in STATE_CODES:
         name_variants = ["State", "state", "State Abbrev", "State Code"]
         clauses = [f'UPPER({{{f}}})="{state}"' for f in name_variants]
         formula = "OR(" + ",".join(clauses) + ")"
-
     sorts = [{"field": "Date of Event", "direction": "desc"}]
-
-    records = _airtable.all(
-        formula=formula,   # correct kwarg for pyairtable 2.2.x
-        sort=sorts,
-        max_records=limit
-    )
-
+    records = _airtable.all(formula=formula, sort=sorts, max_records=limit)
     rows = []
     for rec in records:
         fields = rec.get("fields", {}) or {}
@@ -181,6 +161,7 @@ def config_status():
         "airtable_configured": bool(_airtable),
         "sql_configured": bool(AZURE_SQL_SERVER and AZURE_SQL_DB and AZURE_SQL_USER and AZURE_SQL_PASSWORD),
         "openai_configured": bool(OPENAI_API_KEY),
+        "disable_airtable_summary": DISABLE_AIRTABLE_SUMMARY,
     }
 
 # =============================
@@ -206,7 +187,6 @@ def is_safe_select(sql: str) -> bool:
 def llm_generate_sql(question: str, schema_hint: str = "") -> str:
     if not OPENAI_API_KEY:
         return "SELECT TOP 10 * FROM INFORMATION_SCHEMA.TABLES"
-
     system = (
         "You translate natural-language CRM questions into a SINGLE, safe, read-only "
         "T-SQL SELECT for Azure SQL Server. Use only tables/views mentioned in the schema hint. "
@@ -214,7 +194,6 @@ def llm_generate_sql(question: str, schema_hint: str = "") -> str:
         "Always limit results with TOP 100."
     )
     user = f"Question: {question}\n\nSchema hint:\n{schema_hint}"
-
     resp = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[{"role":"system","content":system},{"role":"user","content":user}],
@@ -222,7 +201,6 @@ def llm_generate_sql(question: str, schema_hint: str = "") -> str:
         max_tokens=300,
     )
     sql = resp.choices[0].message.content.strip()
-    # cleanup
     sql = re.sub(r"^```[a-zA-Z]*", "", sql).strip()
     sql = re.sub(r"```$", "", sql).strip()
     sql = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
@@ -235,10 +213,8 @@ def llm_generate_sql(question: str, schema_hint: str = "") -> str:
 def llm_format_answer(question: str, sample_rows: list) -> str:
     if not sample_rows:
         return "No results found for your question."
-
     if not OPENAI_API_KEY:
         return json.dumps(sample_rows[:5], indent=2)
-
     resp = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[
@@ -281,6 +257,7 @@ class handler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400, {"error":"Invalid JSON"})
 
+        # Diagnostics
         if data.get("test"):
             payload = {"ok": True, **config_status()}
             if data.get("debug") == "airtable":
@@ -308,16 +285,23 @@ class handler(BaseHTTPRequestHandler):
             if use_airtable:
                 state, limit = parse_state_and_limit(question)
                 rows = get_airtable_photos(state=state, limit=limit)
-                answer = llm_format_answer(question, rows)
+
+                # Skip LLM summary for Airtable to avoid stray .startswith issues
+                if DISABLE_AIRTABLE_SUMMARY:
+                    human_state = state or "any state"
+                    answer = f"Found {len(rows)} photos from {human_state}."
+                else:
+                    answer = llm_format_answer(question, rows)
+
                 return self._send(200, {
                     "answer": answer,
                     "query_type": "airtable",
                     "sql": None,
-                    "raw_results": rows,   # normalized to string URLs only
+                    "raw_results": rows,   # normalized list[str] in Photo + first_photo_url
                     "results_count": len(rows),
                 })
 
-            # SQL path
+            # SQL path (unchanged)
             schema_hint = "(List allowed tables/views here)"
             candidate_sql = llm_generate_sql(question, schema_hint)
             if not is_safe_select(candidate_sql):
