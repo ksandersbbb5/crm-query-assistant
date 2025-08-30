@@ -6,40 +6,46 @@ from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import quote as urlquote
 
-import openai
-from pyairtable import Table
-import pymssql
 import requests
 from requests.exceptions import HTTPError
+from pyairtable import Table
+import pymssql
 
-API_VERSION = "2025-08-29-airtable-paging-v12.1"
+# OpenAI is optional for SQL formatting; app runs without it.
+try:
+    import openai  # type: ignore
+except Exception:
+    openai = None
 
-# =============================
-# Environment Variables
-# =============================
+API_VERSION = "2025-08-29-airtable-paging-v12.2"
+
+# -----------------------------
+# Environment
+# -----------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-AIRTABLE_API_KEY    = os.getenv("AIRTABLE_API_KEY")
-AIRTABLE_BASE_ID    = os.getenv("AIRTABLE_BASE_ID")
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME")
 
-AZURE_SQL_SERVER   = os.getenv("AZURE_SQL_SERVER")
-AZURE_SQL_DB       = os.getenv("AZURE_SQL_DB")
-AZURE_SQL_USER     = os.getenv("AZURE_SQL_USER")
+AZURE_SQL_SERVER = os.getenv("AZURE_SQL_SERVER")
+AZURE_SQL_DB = os.getenv("AZURE_SQL_DB")
+AZURE_SQL_USER = os.getenv("AZURE_SQL_USER")
 AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
 
-# Tuning knobs
-DISABLE_AIRTABLE_SUMMARY     = (os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true")
-AIRTABLE_DEFAULT_LIMIT       = int(os.getenv("AIRTABLE_DEFAULT_LIMIT", "50"))
-AIRTABLE_MAX_LIMIT           = int(os.getenv("AIRTABLE_MAX_LIMIT", "5000"))
-AIRTABLE_SCAN_LIMIT          = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))
-AIRTABLE_PAGE_SIZE_DEFAULT   = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50"))
+# Tunables
+DISABLE_AIRTABLE_SUMMARY = os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true"
+AIRTABLE_DEFAULT_LIMIT = int(os.getenv("AIRTABLE_DEFAULT_LIMIT", "50"))
+AIRTABLE_MAX_LIMIT = int(os.getenv("AIRTABLE_MAX_LIMIT", "5000"))
+AIRTABLE_SCAN_LIMIT = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))   # rows scanned for aggregations
+AIRTABLE_PAGE_SIZE_DEFAULT = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50"))  # per-page (1..100)
 
-openai.api_key = OPENAI_API_KEY
+if openai and OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
 
-# =============================
-# Airtable Adapter + Helpers
-# =============================
+# -----------------------------
+# Airtable adapter
+# -----------------------------
 _airtable = None
 if AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME:
     try:
@@ -53,14 +59,14 @@ STATE_NAME_TO_CODE = {
     "maine": "ME",
     "rhode island": "RI",
     "vermont": "VT",
-    "ma": "MA", "me": "ME", "ri": "RI", "vt": "VT",
+    "ma": "MA",
+    "me": "ME",
+    "ri": "RI",
+    "vt": "VT",
 }
 
 def _safe_to_str(val):
-    try:
-        return val if isinstance(val, str) else ""
-    except Exception:
-        return ""
+    return val if isinstance(val, str) else ""
 
 def _to_url_list(value):
     urls = []
@@ -70,72 +76,40 @@ def _to_url_list(value):
     for x in items:
         u = None
         if isinstance(x, dict):
-            candidate = x.get("url")
-            if isinstance(candidate, str):
-                u = candidate
+            cand = x.get("url")
+            if isinstance(cand, str):
+                u = cand
         elif isinstance(x, str):
             u = x
         u = _safe_to_str(u)
-        if u and (u[:4].lower() == "http"):
+        if u and u.lower().startswith("http"):
             urls.append(u)
     return urls
 
 def _normalize_photo_fields(fields: dict):
+    """Ensure fields['Photo'] is a list[str] of urls and add fields['first_photo_url']"""
     candidates = ["Photo", "Photos", "Attachment", "Attachments", "Images", "Image"]
-    found_urls = []
+    found = []
     for key in candidates:
         if key in fields:
             urls = _to_url_list(fields.get(key))
             fields[key] = urls
-            if not found_urls and urls:
-                found_urls = urls
+            if not found and urls:
+                found = urls
     if "Photo" not in fields:
-        fields["Photo"] = found_urls
-    fields["first_photo_url"] = found_urls[0] if found_urls else None
-
-def parse_state_and_limit(question: str):
-    """Find state and limit; supports 'past|last N' and 'all'."""
-    m = re.search(
-        r"\b(?:from|in)\s+(massachusetts|maine|rhode island|vermont|ma|me|ri|vt)\b",
-        question,
-        flags=re.IGNORECASE,
-    )
-    state = None
-    if m:
-        state = STATE_NAME_TO_CODE[m.group(1).lower()]
-    if not state:
-        m2 = re.search(r"\b(MA|ME|RI|VT)\b", question)
-        if m2:
-            state = m2.group(1).upper()
-
-    limit = None
-    m3 = re.search(r"\b(past|last|first|top)\s+(\d+)", question, flags=re.IGNORECASE)
-    if m3:
-        try:
-            limit = int(m3.group(2))
-        except Exception:
-            pass
-
-    if re.search(r"\ball\b", question, flags=re.IGNORECASE):
-        limit = AIRTABLE_MAX_LIMIT
-
-    if limit is None:
-        limit = AIRTABLE_DEFAULT_LIMIT
-
-    limit = max(1, min(AIRTABLE_MAX_LIMIT, limit))
-    return state, limit
+        fields["Photo"] = found
+    fields["first_photo_url"] = found[0] if found else None
 
 def _discover_columns():
     try:
         recs = _airtable.all(max_records=1) if _airtable else []
         if recs:
-            fields = recs[0].get("fields", {}) or {}
-            return set(fields.keys())
+            return set((recs[0].get("fields") or {}).keys())
     except Exception:
         pass
     return set()
 
-def _build_formula_for_state(state: str):
+def _build_formula_for_state(state: str | None):
     if not state or state not in STATE_CODES:
         return None
     existing = _discover_columns()
@@ -143,13 +117,14 @@ def _build_formula_for_state(state: str):
     usable = [f for f in candidates if f in existing]
     if not usable:
         return None
-    clauses = [f'UPPER({{{f}}})="{state}"' for f in usable]
+    clauses = [f'UPPER({{{name}}})="{state}"' for name in usable]
     return "OR(" + ",".join(clauses) + ")"
 
 def _airtable_sort_params(sort_list):
+    """Convert ['-Date of Event','Name'] into Airtable query params."""
     params = {}
     idx = 0
-    for s in sort_list or []:
+    for s in (sort_list or []):
         direction = "asc"
         field = s
         if isinstance(s, str) and s.startswith("-"):
@@ -161,6 +136,7 @@ def _airtable_sort_params(sort_list):
     return params
 
 def _airtable_list_records(formula=None, sort=None, page_size=50, offset=None):
+    """One REST call. Returns (records, next_offset)."""
     if not (AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME):
         return [], None
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{urlquote(AIRTABLE_TABLE_NAME)}"
@@ -184,26 +160,26 @@ def get_airtable_photos_page(state=None, page_size=50, cursor=None):
     try:
         recs, next_cursor = _airtable_list_records(formula=formula, sort=sort, page_size=page_size, offset=cursor)
     except HTTPError as http_err:
-        if hasattr(http_err.response, "status_code") and http_err.response.status_code == 422:
+        # Fallback to no filter if the formula references a column that doesn't exist
+        if getattr(http_err, "response", None) and http_err.response.status_code == 422:
             recs, next_cursor = _airtable_list_records(formula=None, sort=sort, page_size=page_size, offset=cursor)
         else:
             raise
-
     rows = []
-    for rec in recs:
-        fields = rec.get("fields", {}) or {}
+    for r in recs:
+        fields = r.get("fields") or {}
         _normalize_photo_fields(fields)
         rows.append(fields)
     return rows, next_cursor
 
 def fetch_airtable_records_for_aggregation(state=None, max_scan=AIRTABLE_SCAN_LIMIT):
+    """Page through up to max_scan records for aggregate questions."""
     collected = []
     cursor = None
-    page_size = 100
     while len(collected) < max_scan:
         remaining = max_scan - len(collected)
-        ps = min(page_size, remaining)
-        page, cursor = get_airtable_photos_page(state=state, page_size=ps, cursor=cursor)
+        page_size = min(100, remaining)  # Airtable max = 100
+        page, cursor = get_airtable_photos_page(state=state, page_size=page_size, cursor=cursor)
         if not page:
             break
         collected.extend(page)
@@ -211,94 +187,369 @@ def fetch_airtable_records_for_aggregation(state=None, max_scan=AIRTABLE_SCAN_LI
             break
     return collected
 
+def _first_string(x):
+    if isinstance(x, list) and x:
+        return _safe_to_str(x[0]).strip()
+    return _safe_to_str(x).strip()
+
 def _extract_employee_name(fields: dict):
-    first = fields.get("Employee First Name")
-    last  = fields.get("Employee Last Name")
-
-    def _first_string(x):
-        if isinstance(x, list) and x:
-            return _safe_to_str(x[0]).strip()
-        return _safe_to_str(x).strip()
-
-    f = _first_string(first)
-    l = _first_string(last)
+    f = _first_string(fields.get("Employee First Name"))
+    l = _first_string(fields.get("Employee Last Name"))
     if f or l:
         return (l + ", " + f).strip(", ").strip()
-
     sub = fields.get("Submitted by Employee")
     if isinstance(sub, list) and sub:
-        return f\"(Employee {sub[0]})\"
-    return \"(Unknown)\"
+        return f"(Employee {sub[0]})"
+    return "(Unknown)"
 
 def aggregate_top_employees(state=None, top_n=10):
     rows = fetch_airtable_records_for_aggregation(state=state, max_scan=AIRTABLE_SCAN_LIMIT)
     counter = Counter()
     for r in rows:
-        photos = r.get(\"Photo\") or []
+        photos = r.get("Photo") or []
         if isinstance(photos, list) and photos:
-            name = _extract_employee_name(r)
-            counter[name] += 1
-    top = counter.most_common(top_n)
-    return top, len(rows)
+            counter[_extract_employee_name(r)] += 1
+    return counter.most_common(top_n), len(rows)
 
 def aggregate_counts_by_state(state=None, top_n=None):
     rows = fetch_airtable_records_for_aggregation(state=state, max_scan=AIRTABLE_SCAN_LIMIT)
     counter = Counter()
     for r in rows:
-        photos = r.get(\"Photo\") or []
+        photos = r.get("Photo") or []
         if isinstance(photos, list) and photos:
-            st = r.get(\"State\") or r.get(\"state\") or \"\"
+            st = r.get("State") or r.get("state") or "Unknown"
             if isinstance(st, list) and st:
                 st = st[0]
-            st = (st or \"Unknown\").strip()
-            counter[st] += 1
+            counter[(st or "Unknown").strip()] += 1
     items = counter.most_common(top_n) if top_n else counter.most_common()
     labels = [k for k, _ in items]
-    data   = [v for _, v in items]
+    data = [v for _, v in items]
     return labels, data, sum(counter.values())
 
 def aggregate_counts_by_employee_last_name(state=None, top_n=None):
     rows = fetch_airtable_records_for_aggregation(state=state, max_scan=AIRTABLE_SCAN_LIMIT)
     counter = Counter()
     for r in rows:
-        photos = r.get(\"Photo\") or []
+        photos = r.get("Photo") or []
         if isinstance(photos, list) and photos:
-            last = r.get(\"Employee Last Name\")
+            last = r.get("Employee Last Name")
             if isinstance(last, list) and last:
                 last = last[0]
-            last = (last or \"Unknown\").strip()
-            counter[last] += 1
+            counter[(last or "Unknown").strip()] += 1
     items = counter.most_common(top_n) if top_n else counter.most_common()
     labels = [k for k, _ in items]
-    data   = [v for _, v in items]
+    data = [v for _, v in items]
     return labels, data, sum(counter.values())
 
 def aggregate_repeated_events(state=None, min_count=2, top_n=25):
     rows = fetch_airtable_records_for_aggregation(state=state, max_scan=AIRTABLE_SCAN_LIMIT)
-    groups = defaultdict(lambda: {\"count\": 0, \"states\": Counter(), \"dates\": []})
+    groups = defaultdict(lambda: {"count": 0, "states": Counter(), "dates": []})
     for r in rows:
-        name = (r.get(\"Event Name\") or \"\").strip()
+        name = (r.get("Event Name") or "").strip()
         if not name:
             continue
-        groups[name][\"count\"] += 1
-        st = r.get(\"State\") or r.get(\"state\") or \"\"
+        groups[name]["count"] += 1
+        st = r.get("State") or r.get("state") or ""
         if isinstance(st, list) and st:
             st = st[0]
-        st = (st or \"\").strip()
+        st = (st or "").strip()
         if st:
-            groups[name][\"states\"][st] += 1
-        date = r.get(\"Date of Event\")
-        if isinstance(date, str) and date:
-            groups[name][\"dates\"].append(date)
+            groups[name]["states"][st] += 1
+        d = r.get("Date of Event")
+        if isinstance(d, str) and d:
+            groups[name]["dates"].append(d)
 
     items = []
     for name, g in groups.items():
-        if g[\"count\"] >= min_count:
-            states_sorted = sorted(g[\"states\"].items(), key=lambda x: (-x[1], x[0]))
-            items.append({\n                \"event_name\": name,\n                \"count\": g[\"count\"],\n                \"top_states\": [f\"{s} ({c})\" for s, c in states_sorted[:3]],\n                \"first_date\": min(g[\"dates\"]) if g[\"dates\"] else None,\n                \"last_date\": max(g[\"dates\"]) if g[\"dates\"] else None\n            })\n    items.sort(key=lambda x: (-x[\"count\"], x[\"event_name\"]))\n    return items[:top_n], len(rows)\n\n# =============================\n# SQL (unchanged)\n# =============================\n\ndef run_sql(sql: str):\n    conn = None\n    try:\n        conn = pymssql.connect(\n            server=AZURE_SQL_SERVER,\n            user=AZURE_SQL_USER,\n            password=AZURE_SQL_PASSWORD,\n            database=AZURE_SQL_DB,\n            login_timeout=5,\n            timeout=15,\n        )\n        cur = conn.cursor(as_dict=True)\n        cur.execute(sql)\n        rows = cur.fetchall()\n        return rows\n    finally:\n        try:\n            if conn:\n                conn.close()\n        except Exception:\n            pass\n\ndef config_status():\n    return {\n        \"api_version\": API_VERSION,\n        \"airtable_configured\": bool(_airtable),\n        \"sql_configured\": bool(AZURE_SQL_SERVER and AZURE_SQL_DB and AZURE_SQL_USER and AZURE_SQL_PASSWORD),\n        \"openai_configured\": bool(OPENAI_API_KEY),\n        \"disable_airtable_summary\": DISABLE_AIRTABLE_SUMMARY,\n        \"airtable_default_limit\": AIRTABLE_DEFAULT_LIMIT,\n        \"airtable_max_limit\": AIRTABLE_MAX_LIMIT,\n        \"airtable_scan_limit\": AIRTABLE_SCAN_LIMIT,\n        \"airtable_page_size_default\": AIRTABLE_PAGE_SIZE_DEFAULT,\n    }\n\n_SQL_BLOCKLIST = re.compile(\n    r\"(;|--|/\\*|\\*/|\\\\x| drop | alter | delete | insert | update | merge | exec | execute | xp_| sp_)\",\n    flags=re.IGNORECASE,\n)\n\ndef is_safe_select(sql: str) -> bool:\n    if not sql:\n        return False\n    if _SQL_BLOCKLIST.search(sql):\n        return False\n    if not re.match(r\"^\\s*select\\s\", sql, flags=re.IGNORECASE):\n        return False\n    return True\n\n# =============================\n# LLM (SQL only)\n# =============================\n\ndef llm_generate_sql(question: str, schema_hint: str = \"\") -> str:\n    if not OPENAI_API_KEY:\n        return \"SELECT TOP 10 * FROM INFORMATION_SCHEMA.TABLES\"\n    system = (\n        \"You translate natural-language CRM questions into a SINGLE, safe, read-only \"\n        \"T-SQL SELECT for Azure SQL Server. Use only tables/views mentioned in the schema hint. \"\n        \"Return ONLY the SQL, with no code fences, no comments, no CTEs, no variables, and no semicolons. \"\n        \"Always limit results with TOP 100.\"\n    )\n    user = f\"Question: {question}\\n\\nSchema hint:\\n{schema_hint}\"\n    resp = openai.ChatCompletion.create(\n        model=\"gpt-3.5-turbo\",\n        messages=[{\"role\":\"system\",\"content\":system},{\"role\":\"user\",\"content\":user}],\n        temperature=0.0,\n        max_tokens=300,\n    )\n    sql = resp.choices[0].message.content.strip()\n    sql = re.sub(r\"^```[a-zA-Z]*\", \"\", sql).strip()\n    sql = re.sub(r\"```$\", \"\", sql).strip()\n    sql = re.sub(r\"--.*?$\", \"\", sql, flags=re.MULTILINE)\n    sql = re.sub(r\"/\\*.*?\\*/\", \"\", sql, flags=re.DOTALL)\n    sql = sql.split(\";\")[0].strip()\n    if re.search(r\"\\bTOP\\s+\\d+\\b\", sql, flags=re.IGNORECASE) is None:\n        sql = re.sub(r\"^\\s*select\\s\", \"SELECT TOP 100 \", sql, flags=re.IGNORECASE)\n    return sql\n\ndef llm_format_answer(question: str, sample_rows: list) -> str:\n    if not sample_rows:\n        return \"No results found for your question.\"\n    if not OPENAI_API_KEY:\n        return json.dumps(sample_rows[:5], indent=2)\n    resp = openai.ChatCompletion.create(\n        model=\"gpt-3.5-turbo\",\n        messages=[\n            {\"role\":\"system\",\"content\":\"Summarize the data into a direct, business-friendly answer (1–2 sentences).\"},\n            {\"role\":\"user\",\"content\":f\"Question: {question}\\n\\nRows:\\n{json.dumps(sample_rows[:5], indent=2)}\"},\n        ],\n        temperature=0.2,\n        max_tokens=300,\n    )\n    return resp.choices[0].message.content.strip()\n\n# =============================\n# Intent detection (Airtable)\n# =============================\n\ndef is_employee_most_photos_intent(q: str) -> bool:\n    ql = q.lower()\n    return (\"employee\" in ql) and ((\"most photos\" in ql) or (\"most pictures\" in ql) or (\"who has the most\" in ql))\n\ndef is_event_repeats_intent(q: str) -> bool:\n    ql = q.lower()\n    return (\"event\" in ql) and ((\"more than once\" in ql) or (\"repeated\" in ql) or (\"duplicates\" in ql) or (\"duplicate\" in ql))\n\ndef is_bar_chart_by_state_intent(q: str) -> bool:\n    ql = q.lower()\n    return (\"bar chart\" in ql) and ((\"by state\" in ql) or (\"state\" in ql))\n\ndef is_bar_chart_by_employee_last_intent(q: str) -> bool:\n    ql = q.lower()\n    return (\"bar chart\" in ql) and ((\"employee last name\" in ql) or (\"by employee\" in ql))\n\n# =============================\n# HTTP Handler\n# =============================\nclass handler(BaseHTTPRequestHandler):\n    def _send(self, status: int, payload: dict):\n        body = json.dumps(payload).encode()\n        self.send_response(status)\n        self.send_header(\"Content-Type\", \"application/json\")\n        self.send_header(\"Access-Control-Allow-Origin\", \"*\")\n        self.send_header(\"Cache-Control\", \"no-store\")\n        self.end_headers()\n        self.wfile.write(body)\n\n    def do_OPTIONS(self):\n        self.send_response(204)\n        self.send_header(\"Access-Control-Allow-Origin\", \"*\")\n        self.send_header(\"Access-Control-Allow-Headers\", \"Content-Type, X-API-Key\")\n        self.send_header(\"Access-Control-Allow-Methods\", \"POST, GET, OPTIONS\")\n        self.end_headers()\n\n    def do_GET(self):\n        return self._send(200, {\"status\":\"ok\",\"config\":config_status()})\n\n    def do_POST(self):\n        try:\n            length = int(self.headers.get(\"Content-Length\", 0))\n            raw = self.rfile.read(length).decode(\"utf-8\") if length else \"{}\"\n            data = json.loads(raw or \"{}\")\n        except Exception:\n            return self._send(400, {\"error\":\"Invalid JSON\"})\n\n        # Diagnostics\n        if data.get(\"test\"):\n            payload = {\"ok\": True, **config_status()}\n            if data.get(\"debug\") == \"airtable\":\n                sample = []\n                try:\n                    recs, _ = _airtable_list_records(page_size=1) if _airtable else ([], None)\n                    for r in recs:\n                        before = (r.get(\"fields\", {}) or {}).copy()\n                        after = (r.get(\"fields\", {}) or {}).copy()\n                        _normalize_photo_fields(after)\n                        sample.append({\"before\": before, \"after\": after})\n                except Exception as e:\n                    sample = [{\"error\": str(e)}]\n                payload[\"airtable_sample\"] = sample\n            return self._send(200, payload)\n\n        question = (data.get(\"question\") or \"\").strip()\n        if not question:\n            return self._send(400, {\"error\":\"Missing 'question'\"})\n\n        ql = question.lower()\n        use_airtable = (\"photo\" in ql) or (\"airtable\" in ql) or (\"event\" in ql)\n\n        try:\n            if use_airtable:\n                state, overall_limit = parse_state_and_limit(question)\n\n                # Intent: top employee by photos\n                if is_employee_most_photos_intent(question):\n                    try:\n                        top, scanned = aggregate_top_employees(state=state, top_n=10)\n                    except Exception as inner_e:\n                        tb = traceback.format_exc()\n                        return self._send(500, {\"error\": str(inner_e), \"trace\": tb, \"context\": {\"state\": state}})\n                    if not top:\n                        ans = \"I didn’t find any photos.\"\n                    else:\n                        leader, leader_count = top[0]\n                        ans = f\"{leader} has the most photos with {leader_count}.\"\n                        if len(top) > 1:\n                            tail = \"; \".join([f\"{name} ({count})\" for name, count in top[1:5]])\n                            if tail:\n                                ans += f\" Next: {tail}.\"\n                    return self._send(200, {\n                        \"answer\": ans,\n                        \"query_type\": \"airtable\",\n                        \"sql\": None,\n                        \"raw_results\": [],\n                        \"results_count\": scanned,\n                        \"next_cursor\": None\n                    })\n\n                # Intent: repeated events\n                if is_event_repeats_intent(question):\n                    try:\n                        items, scanned = aggregate_repeated_events(state=state, min_count=2, top_n=25)\n                    except Exception as inner_e:\n                        tb = traceback.format_exc()\n                        return self._send(500, {\"error\": str(inner_e), \"trace\": tb, \"context\": {\"state\": state}})\n                    if not items:\n                        ans = \"No events were found more than once.\"\n                    else:\n                        ans = f\"Found {len(items)} events that occurred more than once.\"\n                    return self._send(200, {\n                        \"answer\": ans,\n                        \"query_type\": \"airtable\",\n                        \"sql\": None,\n                        \"aggregations\": {\"type\": \"event_repeats\", \"items\": items},\n                        \"raw_results\": [],\n                        \"results_count\": scanned,\n                        \"next_cursor\": None\n                    })\n\n                # Intent: bar chart by state\n                if is_bar_chart_by_state_intent(question):\n                    labels, data_points, total = aggregate_counts_by_state(state=state)\n                    ans = f\"Photo counts by state (total {total}).\"\n                    return self._send(200, {\n                        \"answer\": ans,\n                        \"query_type\": \"airtable\",\n                        \"sql\": None,\n                        \"chart\": {\n                            \"type\": \"bar\",\n                            \"labels\": labels,\n                            \"datasets\": [{\"label\": \"Photos\", \"data\": data_points}]\n                        },\n                        \"raw_results\": [],\n                        \"results_count\": total,\n                        \"next_cursor\": None\n                    })\n\n                # Intent: bar chart by employee last name\n                if is_bar_chart_by_employee_last_intent(question):\n                    labels, data_points, total = aggregate_counts_by_employee_last_name(state=state)\n                    ans = f\"Photo counts by employee last name (total {total}).\"\n                    return self._send(200, {\n                        \"answer\": ans,\n                        \"query_type\": \"airtable\",\n                        \"sql\": None,\n                        \"chart\": {\n                            \"type\": \"bar\",\n                            \"labels\": labels,\n                            \"datasets\": [{\"label\": \"Photos\", \"data\": data_points}]\n                        },\n                        \"raw_results\": [],\n                        \"results_count\": total,\n                        \"next_cursor\": None\n                    })\n\n                # Default: paged photo listing\n                cursor = data.get(\"cursor\") or None\n                page_size = data.get(\"page_size\")\n                try:\n                    ps_default = max(1, min(100, AIRTABLE_PAGE_SIZE_DEFAULT))\n                    ps = max(1, min(100, int(page_size))) if page_size else ps_default\n                except Exception:\n                    ps = max(1, min(100, AIRTABLE_PAGE_SIZE_DEFAULT))\n                ps = min(ps, overall_limit)\n\n                try:\n                    rows, next_cursor = get_airtable_photos_page(state=state, page_size=ps, cursor=cursor)\n                except Exception as inner_e:\n                    tb = traceback.format_exc()\n                    return self._send(500, {\"error\": str(inner_e), \"trace\": tb, \"context\": {\"state\": state, \"page_size\": ps, \"cursor\": cursor}})\n\n                human_state = state or \"any state\"\n                more = \" (more available)\" if next_cursor else \"\"\n                answer = f\"Returned {len(rows)} photos from {human_state}{more}.\"\n\n                return self._send(200, {\n                    \"answer\": answer,\n                    \"query_type\": \"airtable\",\n                    \"sql\": None,\n                    \"raw_results\": rows,\n                    \"results_count\": len(rows),\n                    \"next_cursor\": next_cursor\n                })\n\n            # SQL path\n            schema_hint = \"(List allowed tables/views here)\"\n            candidate_sql = llm_generate_sql(question, schema_hint)\n            if not is_safe_select(candidate_sql):\n                return self._send(400, {\"error\":\"Generated SQL failed safety checks\",\"sql\":candidate_sql})\n\n            rows = run_sql(candidate_sql)\n            answer = llm_format_answer(question, rows)\n            return self._send(200, {\n                \"answer\": answer,\n                \"query_type\": \"sql\",\n                \"sql\": candidate_sql,\n                \"raw_results\": rows[:200],\n                \"results_count\": len(rows),\n                \"next_cursor\": None\n            })\n\n        except Exception as e:\n            tb = traceback.format_exc()\n            return self._send(500, {\"error\": str(e), \"trace\": tb})\n```
+        if g["count"] >= min_count:
+            states_sorted = sorted(g["states"].items(), key=lambda x: (-x[1], x[0]))
+            items.append({
+                "event_name": name,
+                "count": g["count"],
+                "top_states": [f"{s} ({c})" for s, c in states_sorted[:3]],
+                "first_date": min(g["dates"]) if g["dates"] else None,
+                "last_date": max(g["dates"]) if g["dates"] else None
+            })
+    items.sort(key=lambda x: (-x["count"], x["event_name"]))
+    return items[:top_n], len(rows)
 
----
+# -----------------------------
+# SQL helpers
+# -----------------------------
+_SQL_BLOCKLIST = re.compile(r"(;|--|/\*|\*/|\\x| drop | alter | delete | insert | update | merge | exec | execute | xp_| sp_)",
+                            flags=re.IGNORECASE)
 
-## What you should see
-1. Replace `api/query.py` with the file above, redeploy.
-2. Hard-refresh the app and hit **Run System Test** — it should show:
+def run_sql(sql: str):
+    conn = None
+    try:
+        conn = pymssql.connect(
+            server=AZURE_SQL_SERVER,
+            user=AZURE_SQL_USER,
+            password=AZURE_SQL_PASSWORD,
+            database=AZURE_SQL_DB,
+            login_timeout=5,
+            timeout=15,
+        )
+        cur = conn.cursor(as_dict=True)
+        cur.execute(sql)
+        return cur.fetchall()
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def is_safe_select(sql: str) -> bool:
+    if not sql:
+        return False
+    if _SQL_BLOCKLIST.search(sql):
+        return False
+    if not re.match(r"^\s*select\s", sql, flags=re.IGNORECASE):
+        return False
+    return True
+
+def llm_generate_sql(question: str, schema_hint: str = "") -> str:
+    if not (openai and OPENAI_API_KEY):
+        return "SELECT TOP 100 * FROM INFORMATION_SCHEMA.TABLES"
+    system = (
+        "Translate NL CRM questions into a single, safe, read-only T-SQL SELECT for Azure SQL. "
+        "Use only tables mentioned in the schema hint. "
+        "Return ONLY the SQL, no code fences, comments or semicolons. "
+        "Always include TOP 100."
+    )
+    user = f"Question: {question}\n\nSchema hint:\n{schema_hint}"
+    resp = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.0,
+        max_tokens=300,
+    )
+    sql = resp.choices[0].message.content.strip()
+    sql = re.sub(r"^```[a-zA-Z]*", "", sql).strip()
+    sql = re.sub(r"```$", "", sql).strip()
+    sql = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
+    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+    sql = sql.split(";")[0].strip()
+    if re.search(r"\bTOP\s+\d+\b", sql, flags=re.IGNORECASE) is None:
+        sql = re.sub(r"^\s*select\s", "SELECT TOP 100 ", sql, flags=re.IGNORECASE)
+    return sql
+
+def llm_format_answer(question: str, sample_rows: list) -> str:
+    if not sample_rows:
+        return "No results found for your question."
+    if not (openai and OPENAI_API_KEY):
+        return json.dumps(sample_rows[:5], indent=2)
+    resp = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "Summarize the data into a direct, business-friendly answer (1–2 sentences)."},
+            {"role": "user", "content": f"Question: {question}\n\nRows:\n{json.dumps(sample_rows[:5], indent=2)}"},
+        ],
+        temperature=0.2,
+        max_tokens=300,
+    )
+    return resp.choices[0].message.content.strip()
+
+# -----------------------------
+# Intent detection (Airtable)
+# -----------------------------
+def is_employee_most_photos_intent(q: str) -> bool:
+    ql = q.lower()
+    return ("employee" in ql) and (("most photos" in ql) or ("most pictures" in ql) or ("who has the most" in ql)))
+
+def is_event_repeats_intent(q: str) -> bool:
+    ql = q.lower()
+    return ("event" in ql) and (("more than once" in ql) or ("repeated" in ql) or ("duplicates" in ql) or ("duplicate" in ql))
+
+def is_bar_chart_by_state_intent(q: str) -> bool:
+    ql = q.lower()
+    return ("bar chart" in ql) and (("by state" in ql) or ("state" in ql)))
+
+def is_bar_chart_by_employee_last_intent(q: str) -> bool:
+    ql = q.lower()
+    return ("bar chart" in ql) and (("employee last name" in ql) or ("by employee" in ql)))
+
+# -----------------------------
+# Status
+# -----------------------------
+def config_status():
+    return {
+        "api_version": API_VERSION,
+        "airtable_configured": bool(_airtable),
+        "sql_configured": bool(AZURE_SQL_SERVER and AZURE_SQL_DB and AZURE_SQL_USER and AZURE_SQL_PASSWORD),
+        "openai_configured": bool(OPENAI_API_KEY),
+        "disable_airtable_summary": DISABLE_AIRTABLE_SUMMARY,
+        "airtable_default_limit": AIRTABLE_DEFAULT_LIMIT,
+        "airtable_max_limit": AIRTABLE_MAX_LIMIT,
+        "airtable_scan_limit": AIRTABLE_SCAN_LIMIT,
+        "airtable_page_size_default": AIRTABLE_PAGE_SIZE_DEFAULT,
+    }
+
+# -----------------------------
+# HTTP handler
+# -----------------------------
+class handler(BaseHTTPRequestHandler):
+    def _send(self, status: int, payload: dict):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.end_headers()
+
+    def do_GET(self):
+        return self._send(200, {"status": "ok", "config": config_status()})
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+            data = json.loads(raw or "{}")
+        except Exception:
+            return self._send(400, {"error": "Invalid JSON"})
+
+        # Diagnostics
+        if data.get("test"):
+            payload = {"ok": True, **config_status()}
+            if data.get("debug") == "airtable":
+                sample = []
+                try:
+                    recs, _ = _airtable_list_records(page_size=1) if _airtable else ([], None)
+                    for r in recs:
+                        before = (r.get("fields") or {}).copy()
+                        after = (r.get("fields") or {}).copy()
+                        _normalize_photo_fields(after)
+                        sample.append({"before": before, "after": after})
+                except Exception as e:
+                    sample = [{"error": str(e)}]
+                payload["airtable_sample"] = sample
+            return self._send(200, payload)
+
+        question = (data.get("question") or "").strip()
+        if not question:
+            return self._send(400, {"error": "Missing 'question'"})
+
+        ql = question.lower()
+        use_airtable = ("photo" in ql) or ("airtable" in ql) or ("event" in ql)
+
+        try:
+            if use_airtable:
+                # Airtable path
+                state, overall_limit = parse_state_and_limit(question)
+
+                if is_employee_most_photos_intent(question):
+                    top, scanned = aggregate_top_employees(state=state, top_n=10)
+                    if not top:
+                        ans = "I didn’t find any photos."
+                    else:
+                        leader, leader_count = top[0]
+                        ans = f"{leader} has the most photos with {leader_count}."
+                        if len(top) > 1:
+                            tail = "; ".join([f"{n} ({c})" for n, c in top[1:5]])
+                            if tail:
+                                ans += f" Next: {tail}."
+                    return self._send(200, {
+                        "answer": ans, "query_type": "airtable", "sql": None,
+                        "raw_results": [], "results_count": scanned, "next_cursor": None
+                    })
+
+                if is_event_repeats_intent(question):
+                    items, scanned = aggregate_repeated_events(state=state, min_count=2, top_n=25)
+                    ans = "No events were found more than once." if not items else f"Found {len(items)} events that occurred more than once."
+                    return self._send(200, {
+                        "answer": ans, "query_type": "airtable", "sql": None,
+                        "aggregations": {"type": "event_repeats", "items": items},
+                        "raw_results": [], "results_count": scanned, "next_cursor": None
+                    })
+
+                if is_bar_chart_by_state_intent(question):
+                    labels, data_pts, total = aggregate_counts_by_state(state=state)
+                    ans = f"Photo counts by state (total {total})."
+                    return self._send(200, {
+                        "answer": ans, "query_type": "airtable", "sql": None,
+                        "chart": {"type": "bar", "labels": labels, "datasets": [{"label": "Photos", "data": data_pts}]},
+                        "raw_results": [], "results_count": total, "next_cursor": None
+                    })
+
+                if is_bar_chart_by_employee_last_intent(question):
+                    labels, data_pts, total = aggregate_counts_by_employee_last_name(state=state)
+                    ans = f"Photo counts by employee last name (total {total})."
+                    return self._send(200, {
+                        "answer": ans, "query_type": "airtable", "sql": None,
+                        "chart": {"type": "bar", "labels": labels, "datasets": [{"label": "Photos", "data": data_pts}]},
+                        "raw_results": [], "results_count": total, "next_cursor": None
+                    })
+
+                # Default: paged list of photos
+                cursor = data.get("cursor") or None
+                page_size = data.get("page_size")
+                try:
+                    ps_default = max(1, min(100, AIRTABLE_PAGE_SIZE_DEFAULT))
+                    ps = max(1, min(100, int(page_size))) if page_size else ps_default
+                except Exception:
+                    ps = max(1, min(100, AIRTABLE_PAGE_SIZE_DEFAULT))
+                ps = min(ps, overall_limit)
+
+                rows, next_cursor = get_airtable_photos_page(state=state, page_size=ps, cursor=cursor)
+                human_state = state or "any state"
+                more = " (more available)" if next_cursor else ""
+                answer = f"Returned {len(rows)} photos from {human_state}{more}."
+
+                return self._send(200, {
+                    "answer": answer, "query_type": "airtable", "sql": None,
+                    "raw_results": rows, "results_count": len(rows), "next_cursor": next_cursor
+                })
+
+            # SQL path
+            schema_hint = "(List allowed tables/views here)"
+            candidate_sql = llm_generate_sql(question, schema_hint)
+            if not is_safe_select(candidate_sql):
+                return self._send(400, {"error": "Generated SQL failed safety checks", "sql": candidate_sql})
+
+            rows = run_sql(candidate_sql)
+            answer = llm_format_answer(question, rows)
+            return self._send(200, {
+                "answer": answer, "query_type": "sql", "sql": candidate_sql,
+                "raw_results": rows[:200], "results_count": len(rows), "next_cursor": None
+            })
+
+        except Exception as e:
+            tb = traceback.format_exc()
+            return self._send(500, {"error": str(e), "trace": tb})
+
+# -----------------------------
+# Small helpers used above
+# -----------------------------
+def parse_state_and_limit(question: str):
+    """Extract optional state + result limit from user question."""
+    m = re.search(r"\b(?:from|in)\s+(massachusetts|maine|rhode island|vermont|ma|me|ri|vt)\b", question, flags=re.IGNORECASE)
+    state = None
+    if m:
+        state = STATE_NAME_TO_CODE[m.group(1).lower()]
+    if not state:
+        m2 = re.search(r"\b(MA|ME|RI|VT)\b", question)
+        if m2:
+            state = m2.group(1).upper()
+
+    limit = None
+    m3 = re.search(r"\b(past|last|first|top)\s+(\d+)", question, flags=re.IGNORECASE)
+    if m3:
+        try:
+            limit = int(m3.group(2))
+        except Exception:
+            pass
+    if re.search(r"\ball\b", question, flags=re.IGNORECASE):
+        limit = AIRTABLE_MAX_LIMIT
+    if limit is None:
+        limit = AIRTABLE_DEFAULT_LIMIT
+    limit = max(1, min(AIRTABLE_MAX_LIMIT, limit))
+    return state, limit
