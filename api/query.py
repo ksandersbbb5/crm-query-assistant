@@ -16,7 +16,7 @@ try:
 except Exception:
     openai = None
 
-API_VERSION = "2025-08-29-airtable-paging-v12.3"
+API_VERSION = "2025-08-29-airtable-paging-v12.4"
 
 # -----------------------------
 # Environment
@@ -36,8 +36,8 @@ AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
 DISABLE_AIRTABLE_SUMMARY = os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true"
 AIRTABLE_DEFAULT_LIMIT = int(os.getenv("AIRTABLE_DEFAULT_LIMIT", "50"))
 AIRTABLE_MAX_LIMIT = int(os.getenv("AIRTABLE_MAX_LIMIT", "5000"))
-AIRTABLE_SCAN_LIMIT = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))
-AIRTABLE_PAGE_SIZE_DEFAULT = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50"))
+AIRTABLE_SCAN_LIMIT = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))         # rows scanned for aggregations
+AIRTABLE_PAGE_SIZE_DEFAULT = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50"))  # 1..100
 
 if openai and OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
@@ -58,10 +58,7 @@ STATE_NAME_TO_CODE = {
     "maine": "ME",
     "rhode island": "RI",
     "vermont": "VT",
-    "ma": "MA",
-    "me": "ME",
-    "ri": "RI",
-    "vt": "VT",
+    "ma": "MA", "me": "ME", "ri": "RI", "vt": "VT",
 }
 
 def _safe_to_str(val):
@@ -273,12 +270,11 @@ def aggregate_repeated_events(state=None, min_count=2, top_n=25):
     return items[:top_n], len(rows)
 
 # -----------------------------
-# SQL helpers
+# SQL helpers (lazy import)
 # -----------------------------
 _SQL_BLOCKLIST = re.compile(r"(;|--|/\*|\*/|\\x| drop | alter | delete | insert | update | merge | exec | execute | xp_| sp_)", flags=re.IGNORECASE)
 
 def run_sql(sql: str):
-    # Lazy import pymssql so the function doesn't crash if driver isn't present
     try:
         import pymssql  # type: ignore
     except Exception as ie:
@@ -374,6 +370,11 @@ def is_bar_chart_by_employee_last_intent(q: str) -> bool:
     ql = q.lower()
     return ("bar chart" in ql) and (("employee last name" in ql) or ("by employee" in ql))
 
+def is_table_counts_by_state_intent(q: str) -> bool:
+    """New: detect 'table of photo counts by state'"""
+    ql = q.lower()
+    return ("table" in ql) and ("count" in ql) and ("state" in ql)
+
 # -----------------------------
 # Status
 # -----------------------------
@@ -406,7 +407,7 @@ class handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+               self.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
         self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
         self.end_headers()
 
@@ -490,6 +491,17 @@ class handler(BaseHTTPRequestHandler):
                     return self._send(200, {
                         "answer": ans, "query_type": "airtable", "sql": None,
                         "chart": {"type": "bar", "labels": labels, "datasets": [{"label": "Photos", "data": data_pts}]},
+                        "raw_results": [], "results_count": total, "next_cursor": None
+                    })
+
+                # NEW: table of counts by state
+                if is_table_counts_by_state_intent(question):
+                    labels, data_pts, total = aggregate_counts_by_state(state=state)
+                    table_rows = [{"state": s, "count": c} for s, c in zip(labels, data_pts)]
+                    ans = f"Table of photo counts by state (total {total})."
+                    return self._send(200, {
+                        "answer": ans, "query_type": "airtable", "sql": None,
+                        "aggregations": {"type": "counts_by_state", "items": table_rows},
                         "raw_results": [], "results_count": total, "next_cursor": None
                     })
 
