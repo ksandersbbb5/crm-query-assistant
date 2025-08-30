@@ -9,17 +9,13 @@ from urllib.parse import quote as urlquote
 import requests
 from requests.exceptions import HTTPError
 
-# OpenAI is optional
 try:
-    import openai  # type: ignore
+    import openai  # optional
 except Exception:
     openai = None
 
 API_VERSION = "2025-08-29-no-pyairtable-v1"
 
-# -----------------------------
-# Environment
-# -----------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
@@ -31,12 +27,11 @@ AZURE_SQL_DB = os.getenv("AZURE_SQL_DB")
 AZURE_SQL_USER = os.getenv("AZURE_SQL_USER")
 AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
 
-# Tunables
 DISABLE_AIRTABLE_SUMMARY = os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true"
 AIRTABLE_DEFAULT_LIMIT = int(os.getenv("AIRTABLE_DEFAULT_LIMIT", "50"))
 AIRTABLE_MAX_LIMIT = int(os.getenv("AIRTABLE_MAX_LIMIT", "5000"))
-AIRTABLE_SCAN_LIMIT = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))         # rows scanned for aggregations
-AIRTABLE_PAGE_SIZE_DEFAULT = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50"))  # 1..100
+AIRTABLE_SCAN_LIMIT = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))
+AIRTABLE_PAGE_SIZE_DEFAULT = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50"))
 
 if openai and OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
@@ -47,9 +42,6 @@ STATE_NAME_TO_CODE = {
     "ma": "MA", "me": "ME", "ri": "RI", "vt": "VT",
 }
 
-# -----------------------------
-# Helpers: strings & photos
-# -----------------------------
 def _safe_to_str(val): return val if isinstance(val, str) else ""
 
 def _to_url_list(value):
@@ -71,7 +63,6 @@ def _to_url_list(value):
     return urls
 
 def _normalize_photo_fields(fields: dict):
-    """Normalize attachments to list[str] in fields['Photo'] and set fields['first_photo_url']."""
     candidates = ["Photo", "Photos", "Attachment", "Attachments", "Images", "Image"]
     found = []
     for key in candidates:
@@ -84,11 +75,7 @@ def _normalize_photo_fields(fields: dict):
         fields["Photo"] = found
     fields["first_photo_url"] = found[0] if found else None
 
-# -----------------------------
-# Airtable REST (no pyairtable)
-# -----------------------------
 def _airtable_sort_params(sort_list):
-    """Convert ['-Date of Event','Name'] into Airtable query params."""
     params = {}
     idx = 0
     for s in (sort_list or []):
@@ -101,7 +88,6 @@ def _airtable_sort_params(sort_list):
     return params
 
 def _airtable_list_records(formula=None, sort=None, page_size=50, offset=None):
-    """One REST call. Returns (records, next_offset)."""
     if not (AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME):
         return [], None
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{urlquote(AIRTABLE_TABLE_NAME)}"
@@ -120,7 +106,6 @@ def _airtable_list_records(formula=None, sort=None, page_size=50, offset=None):
     return data.get("records", []), data.get("offset")
 
 def _discover_columns():
-    """Try to get field names without pyairtable."""
     try:
         recs, _ = _airtable_list_records(page_size=1)
         if recs:
@@ -146,7 +131,6 @@ def get_airtable_photos_page(state=None, page_size=50, cursor=None):
     try:
         recs, next_cursor = _airtable_list_records(formula=formula, sort=sort, page_size=page_size, offset=cursor)
     except HTTPError as http_err:
-        # If formula references a non-existent column, fall back to no filter
         if getattr(http_err, "response", None) and http_err.response.status_code == 422:
             recs, next_cursor = _airtable_list_records(formula=None, sort=sort, page_size=page_size, offset=cursor)
         else:
@@ -257,17 +241,13 @@ def aggregate_repeated_events(state=None, min_count=2, top_n=25):
     items.sort(key=lambda x: (-x["count"], x["event_name"]))
     return items[:top_n], len(rows)
 
-# -----------------------------
-# SQL helpers (lazy import at call-time)
-# -----------------------------
 _SQL_BLOCKLIST = re.compile(r"(;|--|/\*|\*/|\\x| drop | alter | delete | insert | update | merge | exec | execute | xp_| sp_)", flags=re.IGNORECASE)
 
 def run_sql(sql: str):
     try:
-        import pymssql  # type: ignore
+        import pymssql  # lazy import
     except Exception as ie:
         raise RuntimeError(f"SQL driver import failed: {ie}. If deploying on Vercel, ensure pymssql/FreeTDS are available or use a proxy.") from ie
-
     conn = None
     try:
         conn = pymssql.connect(
@@ -339,9 +319,6 @@ def llm_format_answer(question: str, sample_rows: list) -> str:
     )
     return resp.choices[0].message.content.strip()
 
-# -----------------------------
-# Intent detection (Airtable)
-# -----------------------------
 def is_employee_most_photos_intent(q: str) -> bool:
     ql = q.lower()
     return ("employee" in ql) and (("most photos" in ql) or ("most pictures" in ql) or ("who has the most" in ql)))
@@ -362,9 +339,6 @@ def is_table_counts_by_state_intent(q: str) -> bool:
     ql = q.lower()
     return ("table" in ql) and ("count" in ql) and ("state" in ql)
 
-# -----------------------------
-# Status
-# -----------------------------
 def config_status():
     return {
         "api_version": API_VERSION,
@@ -378,9 +352,6 @@ def config_status():
         "airtable_page_size_default": AIRTABLE_PAGE_SIZE_DEFAULT,
     }
 
-# -----------------------------
-# HTTP handler
-# -----------------------------
 class handler(BaseHTTPRequestHandler):
     def _send(self, status: int, payload: dict):
         body = json.dumps(payload).encode()
@@ -409,7 +380,6 @@ class handler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400, {"error": "Invalid JSON"})
 
-        # Diagnostics
         if data.get("test"):
             payload = {"ok": True, **config_status()}
             if data.get("debug") == "airtable":
@@ -435,7 +405,6 @@ class handler(BaseHTTPRequestHandler):
 
         try:
             if use_airtable:
-                # Airtable path
                 state, overall_limit = parse_state_and_limit(question)
 
                 if is_employee_most_photos_intent(question):
@@ -491,7 +460,6 @@ class handler(BaseHTTPRequestHandler):
                         "raw_results": [], "results_count": total, "next_cursor": None
                     })
 
-                # Default: paged list of photos
                 cursor = data.get("cursor") or None
                 page_size = data.get("page_size")
                 try:
@@ -511,7 +479,6 @@ class handler(BaseHTTPRequestHandler):
                     "raw_results": rows, "results_count": len(rows), "next_cursor": next_cursor
                 })
 
-            # SQL path
             schema_hint = "(List allowed tables/views here)"
             candidate_sql = llm_generate_sql(question, schema_hint)
             if not is_safe_select(candidate_sql):
@@ -533,9 +500,6 @@ class handler(BaseHTTPRequestHandler):
             tb = traceback.format_exc()
             return self._send(500, {"error": str(e), "trace": tb})
 
-# -----------------------------
-# Parse state & limit
-# -----------------------------
 def parse_state_and_limit(question: str):
     m = re.search(r"\b(?:from|in)\s+(massachusetts|maine|rhode island|vermont|ma|me|ri|vt)\b", question, flags=re.IGNORECASE)
     state = None
@@ -545,7 +509,6 @@ def parse_state_and_limit(question: str):
         m2 = re.search(r"\b(MA|ME|RI|VT)\b", question)
         if m2:
             state = m2.group(1).upper()
-
     limit = None
     m3 = re.search(r"\b(past|last|first|top)\s+(\d+)", question, flags=re.IGNORECASE)
     if m3:
