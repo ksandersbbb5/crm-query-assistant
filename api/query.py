@@ -1,3 +1,4 @@
+# api/query.py
 import os
 import json
 import re
@@ -6,16 +7,27 @@ from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import quote as urlquote
 
-import requests
-from requests.exceptions import HTTPError
+# Defer non-stdlib imports so cold start can't crash System Test
+def _import_requests():
+    try:
+        import requests  # type: ignore
+        from requests.exceptions import HTTPError  # type: ignore
+        return requests, HTTPError
+    except Exception as e:
+        raise RuntimeError(f"'requests' not available: {e}. Ensure it is in requirements.txt") from e
 
-try:
-    import openai  # optional
-except Exception:
-    openai = None
+def _import_openai_optional():
+    try:
+        import openai  # type: ignore
+        return openai
+    except Exception:
+        return None
 
-API_VERSION = "2025-08-29-no-pyairtable-v1"
+API_VERSION = "2025-08-29-sys-test-safe-v1"
 
+# -----------------------------
+# Environment
+# -----------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
@@ -27,14 +39,17 @@ AZURE_SQL_DB = os.getenv("AZURE_SQL_DB")
 AZURE_SQL_USER = os.getenv("AZURE_SQL_USER")
 AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
 
+# Tunables
 DISABLE_AIRTABLE_SUMMARY = os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true"
 AIRTABLE_DEFAULT_LIMIT = int(os.getenv("AIRTABLE_DEFAULT_LIMIT", "50"))
 AIRTABLE_MAX_LIMIT = int(os.getenv("AIRTABLE_MAX_LIMIT", "5000"))
-AIRTABLE_SCAN_LIMIT = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))
-AIRTABLE_PAGE_SIZE_DEFAULT = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50"))
+AIRTABLE_SCAN_LIMIT = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))         # rows scanned for aggregations
+AIRTABLE_PAGE_SIZE_DEFAULT = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50"))  # 1..100
 
-if openai and OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+# OpenAI optional
+_openai = _import_openai_optional()
+if _openai and OPENAI_API_KEY:
+    _openai.api_key = OPENAI_API_KEY
 
 STATE_CODES = {"MA", "ME", "RI", "VT"}
 STATE_NAME_TO_CODE = {
@@ -42,6 +57,9 @@ STATE_NAME_TO_CODE = {
     "ma": "MA", "me": "ME", "ri": "RI", "vt": "VT",
 }
 
+# -----------------------------
+# Small helpers
+# -----------------------------
 def _safe_to_str(val): return val if isinstance(val, str) else ""
 
 def _to_url_list(value):
@@ -63,6 +81,7 @@ def _to_url_list(value):
     return urls
 
 def _normalize_photo_fields(fields: dict):
+    """Normalize attachments to list[str] in fields['Photo'] and set fields['first_photo_url']."""
     candidates = ["Photo", "Photos", "Attachment", "Attachments", "Images", "Image"]
     found = []
     for key in candidates:
@@ -75,6 +94,9 @@ def _normalize_photo_fields(fields: dict):
         fields["Photo"] = found
     fields["first_photo_url"] = found[0] if found else None
 
+# -----------------------------
+# Airtable REST (requests imported lazily)
+# -----------------------------
 def _airtable_sort_params(sort_list):
     params = {}
     idx = 0
@@ -88,6 +110,7 @@ def _airtable_sort_params(sort_list):
     return params
 
 def _airtable_list_records(formula=None, sort=None, page_size=50, offset=None):
+    requests, HTTPError = _import_requests()
     if not (AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME):
         return [], None
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{urlquote(AIRTABLE_TABLE_NAME)}"
@@ -126,6 +149,7 @@ def _build_formula_for_state(state: str | None):
     return "OR(" + ",".join(clauses) + ")"
 
 def get_airtable_photos_page(state=None, page_size=50, cursor=None):
+    requests, HTTPError = _import_requests()
     formula = _build_formula_for_state(state)
     sort = ["-Date of Event"]
     try:
@@ -241,13 +265,17 @@ def aggregate_repeated_events(state=None, min_count=2, top_n=25):
     items.sort(key=lambda x: (-x["count"], x["event_name"]))
     return items[:top_n], len(rows)
 
+# -----------------------------
+# SQL helpers (lazy import at call-time)
+# -----------------------------
 _SQL_BLOCKLIST = re.compile(r"(;|--|/\*|\*/|\\x| drop | alter | delete | insert | update | merge | exec | execute | xp_| sp_)", flags=re.IGNORECASE)
 
 def run_sql(sql: str):
     try:
-        import pymssql  # lazy import
+        import pymssql  # type: ignore
     except Exception as ie:
         raise RuntimeError(f"SQL driver import failed: {ie}. If deploying on Vercel, ensure pymssql/FreeTDS are available or use a proxy.") from ie
+
     conn = None
     try:
         conn = pymssql.connect(
@@ -278,7 +306,7 @@ def is_safe_select(sql: str) -> bool:
     return True
 
 def llm_generate_sql(question: str, schema_hint: str = "") -> str:
-    if not (openai and OPENAI_API_KEY):
+    if not (_openai and OPENAI_API_KEY):
         return "SELECT TOP 100 * FROM INFORMATION_SCHEMA.TABLES"
     system = (
         "Translate NL CRM questions into a single, safe, read-only T-SQL SELECT for Azure SQL. "
@@ -287,7 +315,7 @@ def llm_generate_sql(question: str, schema_hint: str = "") -> str:
         "Always include TOP 100."
     )
     user = f"Question: {question}\n\nSchema hint:\n{schema_hint}"
-    resp = openai.ChatCompletion.create(
+    resp = _openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.0,
@@ -306,9 +334,9 @@ def llm_generate_sql(question: str, schema_hint: str = "") -> str:
 def llm_format_answer(question: str, sample_rows: list) -> str:
     if not sample_rows:
         return "No results found for your question."
-    if not (openai and OPENAI_API_KEY):
+    if not (_openai and OPENAI_API_KEY):
         return json.dumps(sample_rows[:5], indent=2)
-    resp = openai.ChatCompletion.create(
+    resp = _openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[
             {"role": "system", "content": "Summarize the data into a direct, business-friendly answer (1–2 sentences)."},
@@ -319,26 +347,9 @@ def llm_format_answer(question: str, sample_rows: list) -> str:
     )
     return resp.choices[0].message.content.strip()
 
-def is_employee_most_photos_intent(q: str) -> bool:
-    ql = q.lower()
-    return ("employee" in ql) and (("most photos" in ql) or ("most pictures" in ql) or ("who has the most" in ql)))
-
-def is_event_repeats_intent(q: str) -> bool:
-    ql = q.lower()
-    return ("event" in ql) and (("more than once" in ql) or ("repeated" in ql) or ("duplicates" in ql) or ("duplicate" in ql))
-
-def is_bar_chart_by_state_intent(q: str) -> bool:
-    ql = q.lower()
-    return ("bar chart" in ql) and (("by state" in ql) or ("state" in ql))
-
-def is_bar_chart_by_employee_last_intent(q: str) -> bool:
-    ql = q.lower()
-    return ("bar chart" in ql) and (("employee last name" in ql) or ("by employee" in ql))
-
-def is_table_counts_by_state_intent(q: str) -> bool:
-    ql = q.lower()
-    return ("table" in ql) and ("count" in ql) and ("state" in ql)
-
+# -----------------------------
+# Status
+# -----------------------------
 def config_status():
     return {
         "api_version": API_VERSION,
@@ -352,9 +363,16 @@ def config_status():
         "airtable_page_size_default": AIRTABLE_PAGE_SIZE_DEFAULT,
     }
 
+# -----------------------------
+# HTTP handler
+# -----------------------------
 class handler(BaseHTTPRequestHandler):
     def _send(self, status: int, payload: dict):
-        body = json.dumps(payload).encode()
+        try:
+            body = json.dumps(payload).encode()
+        except Exception as ser:
+            body = json.dumps({"error": "serialization_failed", "detail": str(ser)}).encode()
+            status = 500
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -370,32 +388,37 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # Simple health/config
         return self._send(200, {"status": "ok", "config": config_status()})
 
     def do_POST(self):
+        # Fully guarded so System Test can never crash
         try:
-            length = int(self.headers.get("Content-Length", 0))
+            length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length).decode("utf-8") if length else "{}"
             data = json.loads(raw or "{}")
-        except Exception:
-            return self._send(400, {"error": "Invalid JSON"})
+        except Exception as e:
+            return self._send(400, {"error": "Invalid JSON", "detail": str(e)})
 
+        # 1) System test path: NO external imports/calls
         if data.get("test"):
             payload = {"ok": True, **config_status()}
             if data.get("debug") == "airtable":
-                sample = []
+                # Try a tiny Airtable call, but guard it
                 try:
                     recs, _ = _airtable_list_records(page_size=1)
+                    sample = []
                     for r in recs:
                         before = (r.get("fields") or {}).copy()
                         after = (r.get("fields") or {}).copy()
                         _normalize_photo_fields(after)
                         sample.append({"before": before, "after": after})
+                    payload["airtable_sample"] = sample
                 except Exception as e:
-                    sample = [{"error": str(e)}]
-                payload["airtable_sample"] = sample
+                    payload["airtable_sample"] = [{"error": str(e)}]
             return self._send(200, payload)
 
+        # 2) Real questions
         question = (data.get("question") or "").strip()
         if not question:
             return self._send(400, {"error": "Missing 'question'"})
@@ -418,48 +441,39 @@ class handler(BaseHTTPRequestHandler):
                             tail = "; ".join([f"{n} ({c})" for n, c in top[1:5]])
                             if tail:
                                 ans += f" Next: {tail}."
-                    return self._send(200, {
-                        "answer": ans, "query_type": "airtable", "sql": None,
-                        "raw_results": [], "results_count": scanned, "next_cursor": None
-                    })
+                    return self._send(200, {"answer": ans, "query_type": "airtable", "sql": None,
+                                             "raw_results": [], "results_count": scanned, "next_cursor": None})
 
                 if is_event_repeats_intent(question):
                     items, scanned = aggregate_repeated_events(state=state, min_count=2, top_n=25)
                     ans = "No events were found more than once." if not items else f"Found {len(items)} events that occurred more than once."
-                    return self._send(200, {
-                        "answer": ans, "query_type": "airtable", "sql": None,
-                        "aggregations": {"type": "event_repeats", "items": items},
-                        "raw_results": [], "results_count": scanned, "next_cursor": None
-                    })
+                    return self._send(200, {"answer": ans, "query_type": "airtable", "sql": None,
+                                             "aggregations": {"type": "event_repeats", "items": items},
+                                             "raw_results": [], "results_count": scanned, "next_cursor": None})
 
                 if is_bar_chart_by_state_intent(question):
                     labels, data_pts, total = aggregate_counts_by_state(state=state)
                     ans = f"Photo counts by state (total {total})."
-                    return self._send(200, {
-                        "answer": ans, "query_type": "airtable", "sql": None,
-                        "chart": {"type": "bar", "labels": labels, "datasets": [{"label": "Photos", "data": data_pts}]},
-                        "raw_results": [], "results_count": total, "next_cursor": None
-                    })
+                    return self._send(200, {"answer": ans, "query_type": "airtable", "sql": None,
+                                             "chart": {"type": "bar", "labels": labels, "datasets": [{"label": "Photos", "data": data_pts}]},
+                                             "raw_results": [], "results_count": total, "next_cursor": None})
 
                 if is_bar_chart_by_employee_last_intent(question):
                     labels, data_pts, total = aggregate_counts_by_employee_last_name(state=state)
                     ans = f"Photo counts by employee last name (total {total})."
-                    return self._send(200, {
-                        "answer": ans, "query_type": "airtable", "sql": None,
-                        "chart": {"type": "bar", "labels": labels, "datasets": [{"label": "Photos", "data": data_pts}]},
-                        "raw_results": [], "results_count": total, "next_cursor": None
-                    })
+                    return self._send(200, {"answer": ans, "query_type": "airtable", "sql": None,
+                                             "chart": {"type": "bar", "labels": labels, "datasets": [{"label": "Photos", "data": data_pts}]},
+                                             "raw_results": [], "results_count": total, "next_cursor": None})
 
                 if is_table_counts_by_state_intent(question):
                     labels, data_pts, total = aggregate_counts_by_state(state=state)
                     table_rows = [{"state": s, "count": c} for s, c in zip(labels, data_pts)]
                     ans = f"Table of photo counts by state (total {total})."
-                    return self._send(200, {
-                        "answer": ans, "query_type": "airtable", "sql": None,
-                        "aggregations": {"type": "counts_by_state", "items": table_rows},
-                        "raw_results": [], "results_count": total, "next_cursor": None
-                    })
+                    return self._send(200, {"answer": ans, "query_type": "airtable", "sql": None,
+                                             "aggregations": {"type": "counts_by_state", "items": table_rows},
+                                             "raw_results": [], "results_count": total, "next_cursor": None})
 
+                # Default: paged photos
                 cursor = data.get("cursor") or None
                 page_size = data.get("page_size")
                 try:
@@ -473,12 +487,10 @@ class handler(BaseHTTPRequestHandler):
                 human_state = state or "any state"
                 more = " (more available)" if next_cursor else ""
                 answer = f"Returned {len(rows)} photos from {human_state}{more}."
+                return self._send(200, {"answer": answer, "query_type": "airtable", "sql": None,
+                                         "raw_results": rows, "results_count": len(rows), "next_cursor": next_cursor})
 
-                return self._send(200, {
-                    "answer": answer, "query_type": "airtable", "sql": None,
-                    "raw_results": rows, "results_count": len(rows), "next_cursor": next_cursor
-                })
-
+            # SQL path
             schema_hint = "(List allowed tables/views here)"
             candidate_sql = llm_generate_sql(question, schema_hint)
             if not is_safe_select(candidate_sql):
@@ -491,15 +503,16 @@ class handler(BaseHTTPRequestHandler):
                 return self._send(500, {"error": str(db_e), "trace": tb, "sql": candidate_sql})
 
             answer = llm_format_answer(question, rows)
-            return self._send(200, {
-                "answer": answer, "query_type": "sql", "sql": candidate_sql,
-                "raw_results": rows[:200], "results_count": len(rows), "next_cursor": None
-            })
+            return self._send(200, {"answer": answer, "query_type": "sql", "sql": candidate_sql,
+                                     "raw_results": rows[:200], "results_count": len(rows), "next_cursor": None})
 
         except Exception as e:
             tb = traceback.format_exc()
             return self._send(500, {"error": str(e), "trace": tb})
 
+# -----------------------------
+# Parse state & limit
+# -----------------------------
 def parse_state_and_limit(question: str):
     m = re.search(r"\b(?:from|in)\s+(massachusetts|maine|rhode island|vermont|ma|me|ri|vt)\b", question, flags=re.IGNORECASE)
     state = None
