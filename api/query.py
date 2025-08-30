@@ -23,7 +23,7 @@ def _import_openai_optional():
     except Exception:
         return None
 
-API_VERSION = "2025-08-29-sys-test-safe-v1"
+API_VERSION = "2025-08-29-sys-test-safe-v2"
 
 # -----------------------------
 # Environment
@@ -42,7 +42,7 @@ AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
 # Tunables
 DISABLE_AIRTABLE_SUMMARY = os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true"
 AIRTABLE_DEFAULT_LIMIT = int(os.getenv("AIRTABLE_DEFAULT_LIMIT", "50"))
-AIRTABLE_MAX_LIMIT = int(os.getenv("AIRTABLE_MAX_LIMIT", "5000"))
+AIRTABLE_MAX_LIMIT = int(os.getenv("AIRTABLE_MAX_LIMIT", "1000"))
 AIRTABLE_SCAN_LIMIT = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))         # rows scanned for aggregations
 AIRTABLE_PAGE_SIZE_DEFAULT = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50"))  # 1..100
 
@@ -264,6 +264,29 @@ def aggregate_repeated_events(state=None, min_count=2, top_n=25):
             })
     items.sort(key=lambda x: (-x["count"], x["event_name"]))
     return items[:top_n], len(rows)
+
+# -----------------------------
+# Intent detection (RESTORED)
+# -----------------------------
+def is_employee_most_photos_intent(q: str) -> bool:
+    ql = q.lower()
+    return ("employee" in ql) and (("most photos" in ql) or ("most pictures" in ql) or ("who has the most" in ql)))
+
+def is_event_repeats_intent(q: str) -> bool:
+    ql = q.lower()
+    return ("event" in ql) and (("more than once" in ql) or ("repeated" in ql) or ("duplicates" in ql) or ("duplicate" in ql))
+
+def is_bar_chart_by_state_intent(q: str) -> bool:
+    ql = q.lower()
+    return ("bar chart" in ql) and (("by state" in ql) or ("state" in ql))
+
+def is_bar_chart_by_employee_last_intent(q: str) -> bool:
+    ql = q.lower()
+    return ("bar chart" in ql) and (("employee last name" in ql) or ("by employee" in ql))
+
+def is_table_counts_by_state_intent(q: str) -> bool:
+    ql = q.lower()
+    return ("table" in ql) and ("count" in ql) and ("state" in ql)
 
 # -----------------------------
 # SQL helpers (lazy import at call-time)
