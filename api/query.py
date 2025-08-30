@@ -7,6 +7,8 @@ import openai
 from pyairtable import Table
 import pymssql
 
+API_VERSION = "2025-08-29-photos-normalized-v3"
+
 # =============================
 # Environment Variables
 # =============================
@@ -50,20 +52,21 @@ def _to_url_list(value):
     items = value if isinstance(value, list) else [value]
     for x in items:
         if isinstance(x, str):
+            # only consider http(s) strings
             if x.startswith("http"):
                 urls.append(x)
         elif isinstance(x, dict):
             u = x.get("url")
             if isinstance(u, str) and u.startswith("http"):
                 urls.append(u)
+        # ignore everything else silently
     return urls
 
-def _normalize_photo_fields(fields):
+def _normalize_photo_fields(fields: dict):
     """
-    Mutates `fields` so that any common photo/attachment field contains only URLs.
-    Also sets `first_photo_url` for convenience.
+    Mutates `fields` so that any common photo/attachment field contains only URL strings.
+    Also sets `first_photo_url` for convenience and ensures `Photo` exists as list[str].
     """
-    # Try common attachment field names you might have
     candidates = ["Photo", "Photos", "Attachment", "Attachments", "Images", "Image"]
     found_urls = []
 
@@ -74,11 +77,11 @@ def _normalize_photo_fields(fields):
             if not found_urls and urls:
                 found_urls = urls
 
-    # For backward compatibility: ensure `Photo` exists and is a list[str]
+    # Ensure a canonical Photo field exists
     if "Photo" not in fields:
         fields["Photo"] = found_urls
 
-    # Convenience for old UIs that expect a single URL:
+    # Convenience single URL
     fields["first_photo_url"] = found_urls[0] if found_urls else None
 
 def parse_state_and_limit(question: str):
@@ -103,19 +106,20 @@ def get_airtable_photos(state=None, limit=10):
     if not _airtable:
         return []
 
-    # Build formula using DOUBLE quotes
+    # Build Airtable formula using DOUBLE quotes for string literals
     formula = None
     if state and state in STATE_CODES:
-        # Try several field name variants to match your base
+        # Try several field name variants; the first matching column will work
         name_variants = ["State", "state", "State Abbrev", "State Code"]
         clauses = [f'UPPER({{{f}}})="{state}"' for f in name_variants]
         formula = "OR(" + ",".join(clauses) + ")"
 
-    # Sort newest by a typical date field (adjust as needed)
+    # Sort newest by a likely date field (change if your field name differs)
     sorts = [{"field": "Date of Event", "direction": "desc"}]
 
+    # NOTE: correct kwarg name is `formula=`, not filterByFormula
     records = _airtable.all(
-        formula=formula,   # correct kwarg for pyairtable 2.2.x
+        formula=formula,
         sort=sorts,
         max_records=limit
     )
@@ -123,12 +127,12 @@ def get_airtable_photos(state=None, limit=10):
     rows = []
     for rec in records:
         fields = rec.get("fields", {}) or {}
-        _normalize_photo_fields(fields)  # <-- guarantees only URL strings in photo fields
+        _normalize_photo_fields(fields)  # <-- guarantees only string URLs in photo fields
         rows.append(fields)
     return rows
 
 def fetch_airtable_all():
-    """Generic fetch (also normalized) in case you ask non-photo questions."""
+    """Generic fetch (also normalized) for non-photo questions."""
     if not _airtable:
         return []
     try:
@@ -168,10 +172,11 @@ def run_sql(sql: str):
             pass
 
 # =============================
-# Config Status (used by UI test)
+# Config Status (and version)
 # =============================
 def config_status():
     return {
+        "api_version": API_VERSION,
         "airtable_configured": bool(_airtable),
         "sql_configured": bool(AZURE_SQL_SERVER and AZURE_SQL_DB and AZURE_SQL_USER and AZURE_SQL_PASSWORD),
         "openai_configured": bool(OPENAI_API_KEY),
@@ -265,6 +270,7 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # Health check + version
         return self._send(200, {"status":"ok","config":config_status()})
 
     def do_POST(self):
@@ -275,8 +281,23 @@ class handler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400, {"error":"Invalid JSON"})
 
+        # System test / diagnostics
         if data.get("test"):
-            return self._send(200, {"ok": True, **config_status()})
+            payload = {"ok": True, **config_status()}
+            if data.get("debug") == "airtable":
+                sample = []
+                try:
+                    recs = _airtable.all(max_records=1) if _airtable else []
+                    for r in recs:
+                        f = r.get("fields", {}) or {}
+                        # show what normalization would do
+                        before = json.loads(json.dumps(f))  # shallow clone for readability
+                        _normalize_photo_fields(f)
+                        sample.append({"before": before, "after": f})
+                except Exception as e:
+                    sample = [{"error": str(e)}]
+                payload["airtable_sample"] = sample
+            return self._send(200, payload)
 
         question = (data.get("question") or "").strip()
         if not question:
@@ -298,6 +319,7 @@ class handler(BaseHTTPRequestHandler):
                     "results_count": len(rows),
                 })
 
+            # SQL path
             schema_hint = "(List allowed tables/views here)"
             candidate_sql = llm_generate_sql(question, schema_hint)
             if not is_safe_select(candidate_sql):
