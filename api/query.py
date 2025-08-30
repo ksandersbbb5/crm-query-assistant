@@ -6,15 +6,16 @@ import traceback
 from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import quote as urlquote
+from typing import Optional, Tuple, List, Dict, Any
 
-# Defer non-stdlib imports so cold start can't crash System Test
+# --------- Lazy imports for third-party libs (never at module import) ----------
 def _import_requests():
     try:
         import requests  # type: ignore
         from requests.exceptions import HTTPError  # type: ignore
         return requests, HTTPError
     except Exception as e:
-        raise RuntimeError(f"'requests' not available: {e}. Ensure it is in requirements.txt") from e
+        raise RuntimeError("'requests' not available: %s. Ensure it's in requirements.txt" % e)
 
 def _import_openai_optional():
     try:
@@ -23,7 +24,7 @@ def _import_openai_optional():
     except Exception:
         return None
 
-API_VERSION = "2025-08-29-sys-test-safe-v2"
+API_VERSION = "2025-08-29-sys-test-safe-v3"
 
 # -----------------------------
 # Environment
@@ -43,10 +44,10 @@ AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
 DISABLE_AIRTABLE_SUMMARY = os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true"
 AIRTABLE_DEFAULT_LIMIT = int(os.getenv("AIRTABLE_DEFAULT_LIMIT", "50"))
 AIRTABLE_MAX_LIMIT = int(os.getenv("AIRTABLE_MAX_LIMIT", "1000"))
-AIRTABLE_SCAN_LIMIT = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))         # rows scanned for aggregations
+AIRTABLE_SCAN_LIMIT = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))          # rows scanned for aggregations
 AIRTABLE_PAGE_SIZE_DEFAULT = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50"))  # 1..100
 
-# OpenAI optional
+# OpenAI optional, no fail if missing
 _openai = _import_openai_optional()
 if _openai and OPENAI_API_KEY:
     _openai.api_key = OPENAI_API_KEY
@@ -58,12 +59,13 @@ STATE_NAME_TO_CODE = {
 }
 
 # -----------------------------
-# Small helpers
+# Helpers
 # -----------------------------
-def _safe_to_str(val): return val if isinstance(val, str) else ""
+def _safe_to_str(val: Any) -> str:
+    return val if isinstance(val, str) else ""
 
-def _to_url_list(value):
-    urls = []
+def _to_url_list(value: Any) -> List[str]:
+    urls: List[str] = []
     if value is None:
         return urls
     items = value if isinstance(value, list) else [value]
@@ -80,10 +82,10 @@ def _to_url_list(value):
             urls.append(u)
     return urls
 
-def _normalize_photo_fields(fields: dict):
+def _normalize_photo_fields(fields: Dict[str, Any]) -> None:
     """Normalize attachments to list[str] in fields['Photo'] and set fields['first_photo_url']."""
     candidates = ["Photo", "Photos", "Attachment", "Attachments", "Images", "Image"]
-    found = []
+    found: List[str] = []
     for key in candidates:
         if key in fields:
             urls = _to_url_list(fields.get(key))
@@ -97,24 +99,27 @@ def _normalize_photo_fields(fields: dict):
 # -----------------------------
 # Airtable REST (requests imported lazily)
 # -----------------------------
-def _airtable_sort_params(sort_list):
-    params = {}
+def _airtable_sort_params(sort_list: Optional[List[str]]) -> Dict[str, str]:
+    params: Dict[str, str] = {}
     idx = 0
     for s in (sort_list or []):
         direction, field = ("asc", s)
         if isinstance(s, str) and s.startswith("-"):
             direction, field = ("desc", s[1:])
-        params[f"sort[{idx}][field]"] = field
-        params[f"sort[{idx}][direction]"] = direction
+        params["sort[%d][field]" % idx] = field
+        params["sort[%d][direction]" % idx] = direction
         idx += 1
     return params
 
-def _airtable_list_records(formula=None, sort=None, page_size=50, offset=None):
+def _airtable_list_records(formula: Optional[str] = None,
+                           sort: Optional[List[str]] = None,
+                           page_size: int = 50,
+                           offset: Optional[str] = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     requests, HTTPError = _import_requests()
     if not (AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME):
         return [], None
-    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{urlquote(AIRTABLE_TABLE_NAME)}"
-    params = {}
+    url = "https://api.airtable.com/v0/%s/%s" % (AIRTABLE_BASE_ID, urlquote(AIRTABLE_TABLE_NAME))
+    params: Dict[str, Any] = {}
     if formula:
         params["filterByFormula"] = formula
     ps = max(1, min(100, int(page_size or 50)))
@@ -122,13 +127,13 @@ def _airtable_list_records(formula=None, sort=None, page_size=50, offset=None):
     if offset:
         params["offset"] = offset
     params.update(_airtable_sort_params(sort or []))
-    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
+    headers = {"Authorization": "Bearer %s" % AIRTABLE_API_KEY}
     resp = requests.get(url, headers=headers, params=params, timeout=20)
     resp.raise_for_status()
     data = resp.json()
     return data.get("records", []), data.get("offset")
 
-def _discover_columns():
+def _discover_columns() -> set:
     try:
         recs, _ = _airtable_list_records(page_size=1)
         if recs:
@@ -137,7 +142,7 @@ def _discover_columns():
         pass
     return set()
 
-def _build_formula_for_state(state: str | None):
+def _build_formula_for_state(state: Optional[str]) -> Optional[str]:
     if not state or state not in STATE_CODES:
         return None
     existing = _discover_columns()
@@ -145,29 +150,33 @@ def _build_formula_for_state(state: str | None):
     usable = [f for f in candidates if f in existing]
     if not usable:
         return None
-    clauses = [f'UPPER({{{name}}})="{state}"' for name in usable]
+    clauses = ['UPPER({%s})="%s"' % (name, state) for name in usable]
     return "OR(" + ",".join(clauses) + ")"
 
-def get_airtable_photos_page(state=None, page_size=50, cursor=None):
+def get_airtable_photos_page(state: Optional[str] = None,
+                             page_size: int = 50,
+                             cursor: Optional[str] = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     requests, HTTPError = _import_requests()
     formula = _build_formula_for_state(state)
     sort = ["-Date of Event"]
     try:
         recs, next_cursor = _airtable_list_records(formula=formula, sort=sort, page_size=page_size, offset=cursor)
-    except HTTPError as http_err:
+    except HTTPError as http_err:  # fall back if bad filter names
         if getattr(http_err, "response", None) and http_err.response.status_code == 422:
             recs, next_cursor = _airtable_list_records(formula=None, sort=sort, page_size=page_size, offset=cursor)
         else:
             raise
-    rows = []
+    rows: List[Dict[str, Any]] = []
     for r in recs:
         fields = r.get("fields") or {}
         _normalize_photo_fields(fields)
         rows.append(fields)
     return rows, next_cursor
 
-def fetch_airtable_records_for_aggregation(state=None, max_scan=AIRTABLE_SCAN_LIMIT):
-    collected, cursor = [], None
+def fetch_airtable_records_for_aggregation(state: Optional[str] = None,
+                                           max_scan: int = AIRTABLE_SCAN_LIMIT) -> List[Dict[str, Any]]:
+    collected: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
     while len(collected) < max_scan:
         remaining = max_scan - len(collected)
         page_size = min(100, remaining)
@@ -179,22 +188,22 @@ def fetch_airtable_records_for_aggregation(state=None, max_scan=AIRTABLE_SCAN_LI
             break
     return collected
 
-def _first_string(x):
+def _first_string(x: Any) -> str:
     if isinstance(x, list) and x:
         return _safe_to_str(x[0]).strip()
     return _safe_to_str(x).strip()
 
-def _extract_employee_name(fields: dict):
+def _extract_employee_name(fields: Dict[str, Any]) -> str:
     f = _first_string(fields.get("Employee First Name"))
     l = _first_string(fields.get("Employee Last Name"))
     if f or l:
         return (l + ", " + f).strip(", ").strip()
     sub = fields.get("Submitted by Employee")
     if isinstance(sub, list) and sub:
-        return f"(Employee {sub[0]})"
+        return "(Employee %s)" % sub[0]
     return "(Unknown)"
 
-def aggregate_top_employees(state=None, top_n=10):
+def aggregate_top_employees(state: Optional[str] = None, top_n: int = 10):
     rows = fetch_airtable_records_for_aggregation(state=state, max_scan=AIRTABLE_SCAN_LIMIT)
     counter = Counter()
     for r in rows:
@@ -203,7 +212,7 @@ def aggregate_top_employees(state=None, top_n=10):
             counter[_extract_employee_name(r)] += 1
     return counter.most_common(top_n), len(rows)
 
-def aggregate_counts_by_state(state=None, top_n=None):
+def aggregate_counts_by_state(state: Optional[str] = None, top_n: Optional[int] = None):
     rows = fetch_airtable_records_for_aggregation(state=state, max_scan=AIRTABLE_SCAN_LIMIT)
     counter = Counter()
     for r in rows:
@@ -218,7 +227,7 @@ def aggregate_counts_by_state(state=None, top_n=None):
     data = [v for _, v in items]
     return labels, data, sum(counter.values())
 
-def aggregate_counts_by_employee_last_name(state=None, top_n=None):
+def aggregate_counts_by_employee_last_name(state: Optional[str] = None, top_n: Optional[int] = None):
     rows = fetch_airtable_records_for_aggregation(state=state, max_scan=AIRTABLE_SCAN_LIMIT)
     counter = Counter()
     for r in rows:
@@ -233,9 +242,9 @@ def aggregate_counts_by_employee_last_name(state=None, top_n=None):
     data = [v for _, v in items]
     return labels, data, sum(counter.values())
 
-def aggregate_repeated_events(state=None, min_count=2, top_n=25):
+def aggregate_repeated_events(state: Optional[str] = None, min_count: int = 2, top_n: int = 25):
     rows = fetch_airtable_records_for_aggregation(state=state, max_scan=AIRTABLE_SCAN_LIMIT)
-    groups = defaultdict(lambda: {"count": 0, "states": Counter(), "dates": []})
+    groups: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"count": 0, "states": Counter(), "dates": []})
     for r in rows:
         name = (r.get("Event Name") or "").strip()
         if not name:
@@ -251,14 +260,14 @@ def aggregate_repeated_events(state=None, min_count=2, top_n=25):
         if isinstance(d, str) and d:
             groups[name]["dates"].append(d)
 
-    items = []
+    items: List[Dict[str, Any]] = []
     for name, g in groups.items():
         if g["count"] >= min_count:
             states_sorted = sorted(g["states"].items(), key=lambda x: (-x[1], x[0]))
             items.append({
                 "event_name": name,
                 "count": g["count"],
-                "top_states": [f"{s} ({c})" for s, c in states_sorted[:3]],
+                "top_states": ["%s (%d)" % (s, c) for s, c in states_sorted[:3]],
                 "first_date": min(g["dates"]) if g["dates"] else None,
                 "last_date": max(g["dates"]) if g["dates"] else None
             })
@@ -266,7 +275,7 @@ def aggregate_repeated_events(state=None, min_count=2, top_n=25):
     return items[:top_n], len(rows)
 
 # -----------------------------
-# Intent detection (RESTORED)
+# Intent detection
 # -----------------------------
 def is_employee_most_photos_intent(q: str) -> bool:
     ql = q.lower()
@@ -297,8 +306,7 @@ def run_sql(sql: str):
     try:
         import pymssql  # type: ignore
     except Exception as ie:
-        raise RuntimeError(f"SQL driver import failed: {ie}. If deploying on Vercel, ensure pymssql/FreeTDS are available or use a proxy.") from ie
-
+        raise RuntimeError("SQL driver import failed: %s. Use a proxy or ensure FreeTDS/pymssql are available." % ie)
     conn = None
     try:
         conn = pymssql.connect(
@@ -337,7 +345,7 @@ def llm_generate_sql(question: str, schema_hint: str = "") -> str:
         "Return ONLY the SQL, no code fences, comments or semicolons. "
         "Always include TOP 100."
     )
-    user = f"Question: {question}\n\nSchema hint:\n{schema_hint}"
+    user = "Question: %s\n\nSchema hint:\n%s" % (question, schema_hint)
     resp = _openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -363,7 +371,7 @@ def llm_format_answer(question: str, sample_rows: list) -> str:
         model="gpt-3.5-turbo",
         messages=[
             {"role": "system", "content": "Summarize the data into a direct, business-friendly answer (1–2 sentences)."},
-            {"role": "user", "content": f"Question: {question}\n\nRows:\n{json.dumps(sample_rows[:5], indent=2)}"},
+            {"role": "user", "content": "Question: %s\n\nRows:\n%s" % (question, json.dumps(sample_rows[:5], indent=2))},
         ],
         temperature=0.2,
         max_tokens=300,
@@ -373,7 +381,7 @@ def llm_format_answer(question: str, sample_rows: list) -> str:
 # -----------------------------
 # Status
 # -----------------------------
-def config_status():
+def config_status() -> Dict[str, Any]:
     return {
         "api_version": API_VERSION,
         "airtable_configured": bool(AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME),
@@ -390,7 +398,7 @@ def config_status():
 # HTTP handler
 # -----------------------------
 class handler(BaseHTTPRequestHandler):
-    def _send(self, status: int, payload: dict):
+    def _send(self, status: int, payload: Dict[str, Any]):
         try:
             body = json.dumps(payload).encode()
         except Exception as ser:
@@ -411,11 +419,10 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        # Simple health/config
         return self._send(200, {"status": "ok", "config": config_status()})
 
     def do_POST(self):
-        # Fully guarded so System Test can never crash
+        # Completely guarded parse
         try:
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length).decode("utf-8") if length else "{}"
@@ -423,11 +430,11 @@ class handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._send(400, {"error": "Invalid JSON", "detail": str(e)})
 
-        # 1) System test path: NO external imports/calls
+        # 1) System Test (no third-party imports)
         if data.get("test"):
             payload = {"ok": True, **config_status()}
             if data.get("debug") == "airtable":
-                # Try a tiny Airtable call, but guard it
+                # Optional tiny Airtable probe, but guarded
                 try:
                     recs, _ = _airtable_list_records(page_size=1)
                     sample = []
@@ -459,31 +466,31 @@ class handler(BaseHTTPRequestHandler):
                         ans = "I didn’t find any photos."
                     else:
                         leader, leader_count = top[0]
-                        ans = f"{leader} has the most photos with {leader_count}."
+                        ans = "%s has the most photos with %d." % (leader, leader_count)
                         if len(top) > 1:
-                            tail = "; ".join([f"{n} ({c})" for n, c in top[1:5]])
+                            tail = "; ".join(["%s (%d)" % (n, c) for n, c in top[1:5]])
                             if tail:
-                                ans += f" Next: {tail}."
+                                ans += " Next: %s." % tail
                     return self._send(200, {"answer": ans, "query_type": "airtable", "sql": None,
                                              "raw_results": [], "results_count": scanned, "next_cursor": None})
 
                 if is_event_repeats_intent(question):
                     items, scanned = aggregate_repeated_events(state=state, min_count=2, top_n=25)
-                    ans = "No events were found more than once." if not items else f"Found {len(items)} events that occurred more than once."
+                    ans = "No events were found more than once." if not items else "Found %d events that occurred more than once." % len(items)
                     return self._send(200, {"answer": ans, "query_type": "airtable", "sql": None,
                                              "aggregations": {"type": "event_repeats", "items": items},
                                              "raw_results": [], "results_count": scanned, "next_cursor": None})
 
                 if is_bar_chart_by_state_intent(question):
                     labels, data_pts, total = aggregate_counts_by_state(state=state)
-                    ans = f"Photo counts by state (total {total})."
+                    ans = "Photo counts by state (total %d)." % total
                     return self._send(200, {"answer": ans, "query_type": "airtable", "sql": None,
                                              "chart": {"type": "bar", "labels": labels, "datasets": [{"label": "Photos", "data": data_pts}]},
                                              "raw_results": [], "results_count": total, "next_cursor": None})
 
                 if is_bar_chart_by_employee_last_intent(question):
                     labels, data_pts, total = aggregate_counts_by_employee_last_name(state=state)
-                    ans = f"Photo counts by employee last name (total {total})."
+                    ans = "Photo counts by employee last name (total %d)." % total
                     return self._send(200, {"answer": ans, "query_type": "airtable", "sql": None,
                                              "chart": {"type": "bar", "labels": labels, "datasets": [{"label": "Photos", "data": data_pts}]},
                                              "raw_results": [], "results_count": total, "next_cursor": None})
@@ -491,7 +498,7 @@ class handler(BaseHTTPRequestHandler):
                 if is_table_counts_by_state_intent(question):
                     labels, data_pts, total = aggregate_counts_by_state(state=state)
                     table_rows = [{"state": s, "count": c} for s, c in zip(labels, data_pts)]
-                    ans = f"Table of photo counts by state (total {total})."
+                    ans = "Table of photo counts by state (total %d)." % total
                     return self._send(200, {"answer": ans, "query_type": "airtable", "sql": None,
                                              "aggregations": {"type": "counts_by_state", "items": table_rows},
                                              "raw_results": [], "results_count": total, "next_cursor": None})
@@ -509,7 +516,7 @@ class handler(BaseHTTPRequestHandler):
                 rows, next_cursor = get_airtable_photos_page(state=state, page_size=ps, cursor=cursor)
                 human_state = state or "any state"
                 more = " (more available)" if next_cursor else ""
-                answer = f"Returned {len(rows)} photos from {human_state}{more}."
+                answer = "Returned %d photos from %s%s." % (len(rows), human_state, more)
                 return self._send(200, {"answer": answer, "query_type": "airtable", "sql": None,
                                          "raw_results": rows, "results_count": len(rows), "next_cursor": next_cursor})
 
@@ -536,16 +543,16 @@ class handler(BaseHTTPRequestHandler):
 # -----------------------------
 # Parse state & limit
 # -----------------------------
-def parse_state_and_limit(question: str):
+def parse_state_and_limit(question: str) -> Tuple[Optional[str], int]:
     m = re.search(r"\b(?:from|in)\s+(massachusetts|maine|rhode island|vermont|ma|me|ri|vt)\b", question, flags=re.IGNORECASE)
-    state = None
+    state: Optional[str] = None
     if m:
         state = STATE_NAME_TO_CODE[m.group(1).lower()]
     if not state:
         m2 = re.search(r"\b(MA|ME|RI|VT)\b", question)
         if m2:
             state = m2.group(1).upper()
-    limit = None
+    limit: Optional[int] = None
     m3 = re.search(r"\b(past|last|first|top)\s+(\d+)", question, flags=re.IGNORECASE)
     if m3:
         try:
