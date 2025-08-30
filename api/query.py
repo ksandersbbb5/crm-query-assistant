@@ -4,13 +4,15 @@ import re
 import traceback
 from collections import Counter
 from http.server import BaseHTTPRequestHandler
+from urllib.parse import quote as urlquote
 
 import openai
 from pyairtable import Table
 import pymssql
+import requests
 from requests.exceptions import HTTPError
 
-API_VERSION = "2025-08-29-photos-normalized-v10"
+API_VERSION = "2025-08-29-airtable-paging-v11"
 
 # =============================
 # Environment Variables
@@ -28,9 +30,10 @@ AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
 
 # Tuning knobs
 DISABLE_AIRTABLE_SUMMARY = (os.getenv("DISABLE_AIRTABLE_SUMMARY", "true").lower() == "true")
-AIRTABLE_DEFAULT_LIMIT   = int(os.getenv("AIRTABLE_DEFAULT_LIMIT", "50"))   # used when user doesn't specify N
-AIRTABLE_MAX_LIMIT       = int(os.getenv("AIRTABLE_MAX_LIMIT", "500"))     # cap for "all"
+AIRTABLE_DEFAULT_LIMIT   = int(os.getenv("AIRTABLE_DEFAULT_LIMIT", "50"))   # fallback when user doesn't specify N
+AIRTABLE_MAX_LIMIT       = int(os.getenv("AIRTABLE_MAX_LIMIT", "5000"))     # overall cap for "all" (paging handles it)
 AIRTABLE_SCAN_LIMIT      = int(os.getenv("AIRTABLE_SCAN_LIMIT", "2000"))    # used by aggregations
+AIRTABLE_PAGE_SIZE_DEFAULT = int(os.getenv("AIRTABLE_PAGE_SIZE_DEFAULT", "50"))  # per-page size (1..100)
 
 openai.api_key = OPENAI_API_KEY
 
@@ -117,14 +120,14 @@ def parse_state_and_limit(question: str):
         except Exception:
             pass
 
-    # 'all' keyword
+    # 'all' keyword → we allow more but will page
     if re.search(r"\ball\b", question, flags=re.IGNORECASE):
         limit = AIRTABLE_MAX_LIMIT
 
     if limit is None:
         limit = AIRTABLE_DEFAULT_LIMIT
 
-    # clamp
+    # clamp overall
     limit = max(1, min(AIRTABLE_MAX_LIMIT, limit))
     return state, limit
 
@@ -138,61 +141,93 @@ def _discover_columns():
         pass
     return set()
 
-def get_airtable_photos(state=None, limit=AIRTABLE_DEFAULT_LIMIT):
-    if not _airtable:
-        return []
+def _build_formula_for_state(state: str):
+    """Return a safe formula string that only references existing columns."""
+    if not state or state not in STATE_CODES:
+        return None
+    existing = _discover_columns()
+    candidates = ["State", "state", "State Abbrev", "State Code"]
+    usable = [f for f in candidates if f in existing]
+    if not usable:
+        return None
+    clauses = [f'UPPER({{{f}}})="{state}"' for f in usable]
+    return "OR(" + ",".join(clauses) + ")"
 
-    formula = None
-    if state and state in STATE_CODES:
-        existing = _discover_columns()
-        candidates = ["State", "state", "State Abbrev", "State Code"]
-        usable = [f for f in candidates if f in existing]
-        if usable:
-            clauses = [f'UPPER({{{f}}})="{state}"' for f in usable]
-            formula = "OR(" + ",".join(clauses) + ")"
+def _airtable_sort_params(sort_list):
+    """
+    Convert ["-Date of Event","Name"] → params sort[0][field], sort[0][direction], ...
+    Airtable REST expects this structure; we'll send via requests.
+    """
+    params = {}
+    idx = 0
+    for s in sort_list or []:
+        direction = "asc"
+        field = s
+        if isinstance(s, str) and s.startswith("-"):
+            direction = "desc"
+            field = s[1:]
+        params[f"sort[{idx}][field]"] = field
+        params[f"sort[{idx}][direction]"] = direction
+        idx += 1
+    return params
 
+def _airtable_list_records(formula=None, sort=None, page_size=50, offset=None):
+    """One Airtable page via REST; returns (records, next_offset)"""
+    if not (AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME):
+        return [], None
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{urlquote(AIRTABLE_TABLE_NAME)}"
+    params = {}
+    if formula:
+        params["filterByFormula"] = formula
+    # clamp page size to Airtable max=100
+    ps = max(1, min(100, int(page_size or 50)))
+    params["pageSize"] = ps
+    if offset:
+        params["offset"] = offset
+    params.update(_airtable_sort_params(sort or []))
+    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
+    resp = requests.get(url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("records", []), data.get("offset")
+
+def get_airtable_photos_page(state=None, page_size=50, cursor=None):
+    """Return a single page + next cursor; normalize photos."""
+    formula = _build_formula_for_state(state)
     sort = ["-Date of Event"]
-
     try:
-        records = _airtable.all(formula=formula, sort=sort, max_records=limit)
+        recs, next_cursor = _airtable_list_records(formula=formula, sort=sort, page_size=page_size, offset=cursor)
     except HTTPError as http_err:
+        # If formula invalid for any reason, fallback without it
         if hasattr(http_err.response, "status_code") and http_err.response.status_code == 422:
-            records = _airtable.all(sort=sort, max_records=limit)
+            recs, next_cursor = _airtable_list_records(formula=None, sort=sort, page_size=page_size, offset=cursor)
         else:
             raise
 
     rows = []
-    for rec in records:
+    for rec in recs:
         fields = rec.get("fields", {}) or {}
         _normalize_photo_fields(fields)
         rows.append(fields)
-    return rows
+    return rows, next_cursor
 
 def fetch_airtable_records_for_aggregation(state=None, max_scan=AIRTABLE_SCAN_LIMIT):
-    if not _airtable:
-        return []
-    formula = None
-    if state and state in STATE_CODES:
-        existing = _discover_columns()
-        candidates = ["State", "state", "State Abbrev", "State Code"]
-        usable = [f for f in candidates if f in existing]
-        if usable:
-            clauses = [f'UPPER({{{f}}})="{state}"' for f in usable]
-            formula = "OR(" + ",".join(clauses) + ")"
-    sort = ["-Date of Event"]
-    try:
-        records = _airtable.all(formula=formula, sort=sort, max_records=max_scan)
-    except HTTPError as http_err:
-        if hasattr(http_err.response, "status_code") and http_err.response.status_code == 422:
-            records = _airtable.all(sort=sort, max_records=max_scan)
-        else:
-            raise
-    rows = []
-    for rec in records:
-        fields = rec.get("fields", {}) or {}
-        _normalize_photo_fields(fields)
-        rows.append(fields)
-    return rows
+    """
+    Pull up to max_scan rows using paging for aggregations.
+    """
+    collected = []
+    cursor = None
+    page_size = 100  # max per Airtable
+    while len(collected) < max_scan:
+        remaining = max_scan - len(collected)
+        ps = min(page_size, remaining)
+        page, cursor = get_airtable_photos_page(state=state, page_size=ps, cursor=cursor)
+        if not page:
+            break
+        collected.extend(page)
+        if not cursor:
+            break
+    return collected
 
 def _extract_employee_name(fields: dict):
     first = fields.get("Employee First Name")
@@ -217,9 +252,9 @@ def aggregate_top_employees(state=None, top_n=10):
     rows = fetch_airtable_records_for_aggregation(state=state, max_scan=AIRTABLE_SCAN_LIMIT)
     counter = Counter()
     for r in rows:
-        name = _extract_employee_name(r)
         photos = r.get("Photo") or []
         if isinstance(photos, list) and photos:
+            name = _extract_employee_name(r)
             counter[name] += 1
     top = counter.most_common(top_n)
     return top, len(rows)
@@ -259,6 +294,7 @@ def config_status():
         "airtable_default_limit": AIRTABLE_DEFAULT_LIMIT,
         "airtable_max_limit": AIRTABLE_MAX_LIMIT,
         "airtable_scan_limit": AIRTABLE_SCAN_LIMIT,
+        "airtable_page_size_default": AIRTABLE_PAGE_SIZE_DEFAULT,
     }
 
 _SQL_BLOCKLIST = re.compile(
@@ -355,7 +391,7 @@ class handler(BaseHTTPRequestHandler):
             if data.get("debug") == "airtable":
                 sample = []
                 try:
-                    recs = _airtable.all(max_records=1) if _airtable else []
+                    recs, _ = _airtable_list_records(page_size=1) if _airtable else ([], None)
                     for r in recs:
                         before = (r.get("fields", {}) or {}).copy()
                         after = (r.get("fields", {}) or {}).copy()
@@ -375,7 +411,7 @@ class handler(BaseHTTPRequestHandler):
 
         try:
             if use_airtable:
-                state, limit = parse_state_and_limit(question)
+                state, overall_limit = parse_state_and_limit(question)
 
                 # Intent: top employee by photos
                 if is_employee_most_photos_intent(question):
@@ -397,29 +433,41 @@ class handler(BaseHTTPRequestHandler):
                         "answer": ans,
                         "query_type": "airtable",
                         "sql": None,
-                        "raw_results": [],  # not needed here
-                        "results_count": scanned
+                        "raw_results": [],
+                        "results_count": scanned,
+                        "next_cursor": None
                     })
 
-                # Default Airtable path: fetch photos
+                # Paged photo listing
+                cursor = data.get("cursor") or None
+                page_size = data.get("page_size")
                 try:
-                    rows = get_airtable_photos(state=state, limit=limit)
+                    ps_default = max(1, min(100, AIRTABLE_PAGE_SIZE_DEFAULT))
+                    ps = max(1, min(100, int(page_size))) if page_size else ps_default
+                except Exception:
+                    ps = max(1, min(100, AIRTABLE_PAGE_SIZE_DEFAULT))
+
+                # If user asked for fewer than default, respect that
+                ps = min(ps, overall_limit)
+
+                try:
+                    rows, next_cursor = get_airtable_photos_page(state=state, page_size=ps, cursor=cursor)
                 except Exception as inner_e:
                     tb = traceback.format_exc()
-                    return self._send(500, {"error": str(inner_e), "trace": tb, "context": {"state": state, "limit": limit}})
+                    return self._send(500, {"error": str(inner_e), "trace": tb, "context": {"state": state, "page_size": ps, "cursor": cursor}})
 
-                if DISABLE_AIRTABLE_SUMMARY:
-                    human_state = state or "any state"
-                    answer = f"Found {len(rows)} photos from {human_state}."
-                else:
-                    answer = llm_format_answer(question, rows)
+                # Plain answer (LLM off)
+                human_state = state or "any state"
+                more = " (more available)" if next_cursor else ""
+                answer = f"Returned {len(rows)} photos from {human_state}{more}."
 
                 return self._send(200, {
                     "answer": answer,
                     "query_type": "airtable",
                     "sql": None,
-                    "raw_results": rows,            # NO TRUNCATION
+                    "raw_results": rows,
                     "results_count": len(rows),
+                    "next_cursor": next_cursor
                 })
 
             # SQL path
@@ -436,6 +484,7 @@ class handler(BaseHTTPRequestHandler):
                 "sql": candidate_sql,
                 "raw_results": rows[:200],
                 "results_count": len(rows),
+                "next_cursor": None
             })
 
         except Exception as e:
